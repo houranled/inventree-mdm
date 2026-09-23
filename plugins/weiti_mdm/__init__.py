@@ -115,6 +115,16 @@ def check_category_code_unique(instance):
         return
     code = m.group(1)
     from part.models import PartCategory
+
+    # 码段归属：首位必须等于上级大类的首码（3-线材类 下只能是 3xx）
+    parent = getattr(instance, 'parent', None)
+    if parent is not None:
+        pm = TOP_CODE_RE.match(parent.name or '')
+        if pm and code[0] != pm.group(1):
+            raise ValidationError(
+                f'类别码 {code} 不属于「{parent.name}」的号段，'
+                f'该大类下只能用 {pm.group(1)}xx')
+
     for c in PartCategory.objects.exclude(pk=instance.pk).only('name'):
         mm = CATEGORY_CODE_RE.match(c.name or '')
         if mm and mm.group(1) == code:
