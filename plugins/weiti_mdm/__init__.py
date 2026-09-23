@@ -51,9 +51,9 @@ TOP_CODE_RE = re.compile(r'^(\d)[-\s_]+')
 # 参数选项值前缀: "03-金属膜电阻" -> 03
 OPT_CODE_RE = re.compile(r'^(\d+)')
 # IPN 成品格式: {小类码}-{规格段}，规格段=参数码按序拼接(无流水号)，
-# 如 102-030110301；临时码(参数不全): !102-0001
+# 如 102-030110301；临时码(参数不全): !102-03xx103xx 或 !102-T0001
 IPN_RE = re.compile(r'^\d{3}-[0-9A-Za-z]{2,}$')
-IPN_PROV_RE = re.compile(r'^!\d{3}-\d{4}$')
+IPN_PROV_RE = re.compile(r'^!\d{3}-[0-9A-Za-z]+$')
 
 SERIAL_LEN = 4
 FALLBACK_CODE = '00'  # 参数值无数字前缀时的兜底段
@@ -353,40 +353,62 @@ def _part_params(part):
     return params
 
 
-def feature_segment(part):
-    """按类别参数模板顺序拼接特征段。参数未填全返回 None。"""
+def _slot_width(template):
+    """单个参数模板在规格段中占的位宽。
+
+    - 有选项: 选项码的最大位数（"0-±1%"→1位, "03-金属膜"→2位）
+    - 无选项且像数值型（阻值/容值/感值）: 3位（D1D2有效数字+D3幂）
+    - 其他: 2位兜底
+    """
+    widths = []
+    for c in _template_choices(template):
+        m = OPT_CODE_RE.match(str(c).strip())
+        widths.append(len(m.group(1)) if m else len(FALLBACK_CODE))
+    if widths:
+        return max(widths)
+    name = (getattr(template, 'name', '') or '').lower()
+    if any(k in name for k in ('阻值', '电阻值', 'resistance', '欧姆',
+                               '容值', '感值', '压值')):
+        return 3
+    return len(FALLBACK_CODE)
+
+
+def feature_slots(part):
+    """规格槽位串：按类别绑定顺序，已填参数出码、未填槽位用 x 占位。
+
+    返回 None = 类别无模板绑定且零件无参数（无法构造槽位）。
+    含 x = 规格未录全（临时码用）；不含 x = 规格完整（正式特征段）。
+    """
     cat = getattr(part, 'category', None)
     if not cat:
         return None
 
-    names = []
-    try:
-        from part.models import PartCategoryParameterTemplate
-        tpls = (PartCategoryParameterTemplate.objects
-                .filter(category=cat)
-                .order_by('pk'))
-        for t in tpls:
-            tpl = getattr(t, 'template', None) or getattr(
-                t, 'parameter_template', None)
-            if tpl is not None:
-                names.append(tpl.name)
-    except Exception:
-        names = []
-
+    tpls = category_templates(cat)
     params = _part_params(part)
-    if not names:
-        # 类别没挂模板：按参数名排序拼接（保证确定性）
+
+    if not tpls:
+        # 类别没绑模板：只有已填参数可拼（无槽位概念）
         names = sorted(params.keys())
-    if not names:
-        return None
+        if not names:
+            return None
+        return ''.join(param_code(params[n]) for n in names)
 
     segs = []
-    for name in names:
-        val = params.get(name)
+    for tpl in tpls:
+        val = params.get(tpl.name)
         if val is None or str(val).strip() == '':
-            return None  # 参数没填全，先不编码
-        segs.append(param_code(val))
+            segs.append('x' * _slot_width(tpl))
+        else:
+            segs.append(param_code(val))
     return ''.join(segs)
+
+
+def feature_segment(part):
+    """完整规格段（参数全齐才有）：供正式码和 BOM 去重使用。"""
+    seg = feature_slots(part)
+    if not seg or 'x' in seg:
+        return None
+    return seg
 
 
 def next_serial(prefix):
@@ -405,32 +427,47 @@ def assign_ipn(part):
     """给零件生成/修正 IPN。返回 True 表示 IPN 被改写。
 
     - 参数填全 → 正式码 {code}-{feat}（无流水号：同规格同码，天然去重）
-    - 参数不全且无码 → 临时码 !{code}-{serial}（规格待补标记，
-      临时码仍带流水区分，因为此时没有特征段可分辨）
-    - 临时码在参数补齐后自动升级为正式码
+    - 参数部分填 → 临时码 !{code}-{槽位段}，未填槽位用 x 占位
+    - 完全无规格信息 → 占位码 !{code}-T{serial}
+    - 临时码随参数补齐自动升级，最终成为正式码
     """
     code = get_category_code(part)
     if not code:
         return False
     cur = (part.IPN or '').strip()
-    feat = feature_segment(part)
 
-    if not feat:
-        # 参数不全 → 临时码（已有正式码的不降级，已有临时码的不动）
-        if cur:
+    feat = feature_segment(part)
+    if feat:
+        target = f'{code}-{feat}'
+        if cur == target:
             return False
-        prov_prefix = f'!{code}-'
-        part.IPN = f'{prov_prefix}{next_serial(prov_prefix):0{SERIAL_LEN}d}'
-        logger.info('WeiTiMDM: %s -> %s (临时码，规格未录全)',
+        part.IPN = target
+        logger.info('WeiTiMDM: %s -> %s', part.name, part.IPN)
+        return True
+
+    slots = feature_slots(part)
+    if slots:
+        target = f'!{code}-{slots}'
+        if cur == target:
+            return False
+        part.IPN = target
+        logger.info('WeiTiMDM: %s -> %s (临时码，x=规格槽位待补)',
                     part.name, part.IPN)
         return True
 
-    target = f'{code}-{feat}'
-    if cur == target:
-        return False  # 已是合规 IPN，不动
-
-    part.IPN = target
-    logger.info('WeiTiMDM: %s -> %s', part.name, part.IPN)
+    # 类别未绑模板且无参数 → 纯占位码
+    if cur:
+        return False
+    from part.models import Part
+    prefix = f'!{code}-T'
+    nums = []
+    for ipn in (Part.objects.filter(IPN__startswith=prefix)
+                .values_list('IPN', flat=True)):
+        tail = str(ipn)[len(prefix):]
+        if tail.isdigit():
+            nums.append(int(tail))
+    part.IPN = f'{prefix}{max(nums, default=0) + 1:0{SERIAL_LEN}d}'
+    logger.info('WeiTiMDM: %s -> %s (占位码，规格未录)', part.name, part.IPN)
     return True
 
 
@@ -597,6 +634,14 @@ def on_part_save(sender, instance, **kwargs):
     """零件保存前：导入字段兼容 → 尝试编码。"""
     try:
         fix_import_fields(instance)
+        cat = getattr(instance, 'category', None)
+        if cat is None:
+            logger.warning('WeiTiMDM: 零件 "%s" 未指定类别，无法生成IPN',
+                           instance.name)
+        elif not get_category_code(instance):
+            logger.warning(
+                'WeiTiMDM: 零件 "%s" 挂在大类「%s」下（无3位小类码），'
+                '无法生成IPN——请移到小类', instance.name, cat.name)
         assign_ipn(instance)
     except Exception:
         logger.exception('WeiTiMDM: 零件保存时编码失败 part=%s', instance.pk)
@@ -658,7 +703,7 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
         if ipn and not (IPN_RE.match(s) or IPN_PROV_RE.match(s)):
             raise ValidationError(
                 'IPN 格式须为 {小类码}-{规格段}（如 102-030110301）'
-                '或 !xxx-xxxx 临时码')
+                '或 ! 开头的临时码')
 
     # --------------------------------------------------------------
     # BOM 一键导入页面 (UrlsMixin)
