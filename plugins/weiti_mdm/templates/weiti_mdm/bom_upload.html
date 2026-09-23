@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BOM 一键导入</title>
+  <style>
+    body { font-family: system-ui, "Microsoft YaHei", sans-serif; max-width: 760px;
+           margin: 32px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 20px; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-top: 16px; }
+    label { display: block; margin: 12px 0 4px; font-weight: 600; }
+    input[type=text], input[type=file] { width: 100%; padding: 8px; box-sizing: border-box;
+           border: 1px solid #ccc; border-radius: 6px; }
+    .hint { color: #888; font-size: 13px; margin-top: 4px; }
+    .btn { margin-top: 18px; background: #2f6feb; color: #fff; border: 0; padding: 10px 20px;
+           border-radius: 6px; font-size: 15px; cursor: pointer; }
+    .err { background: #fdecea; color: #b3261e; padding: 10px 14px; border-radius: 6px;
+           margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <h1>BOM 一键导入（去重 + 增量建零件）</h1>
+  <p class="hint">上传 BOM 表 → 下一步映射列 → 预览(缺零件自动建、去重) → 确认落库。</p>
+
+  {% if error %}<div class="err">{{ error }}</div>{% endif %}
+
+  <div class="card">
+    <form method="post" enctype="multipart/form-data">
+      {% csrf_token %}
+      <input type="hidden" name="action" value="upload">
+
+      <label>父零件（顶层产品 / 装配体）</label>
+      <input type="text" name="parent" placeholder="零件 ID、IPN 或 名称，如 101-...-0001 或 小云台" required>
+      <div class="hint">BOM 的所有行都会挂到这个父零件下。</div>
+
+      <label>BOM 文件（.xlsx / .xls / .csv）</label>
+      <input type="file" name="file" accept=".xlsx,.xls,.csv" required>
+      <div class="hint">第一行须为列标题；合并标题行/图片行请先清理。</div>
+
+      <button class="btn" type="submit">下一步：映射列</button>
+    </form>
+  </div>
+</body>
+</html>
