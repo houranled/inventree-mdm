@@ -103,6 +103,25 @@ def auto_code_category(instance):
     logger.error('WeiTiMDM: 大类 %s 码段已用尽，无法为 "%s" 编号', prefix, name)
 
 
+def check_category_code_unique(instance):
+    """手输带码类别名的撞码检查：三位码全库唯一，撞码抛 ValidationError 阻断保存。
+
+    自动编号路径不会撞（它扫过已用码），这里只拦"用户手动输入了已占用码"，
+    如已有 101-传感器 又手建 101-PCB。
+    """
+    name = (instance.name or '').strip()
+    m = CATEGORY_CODE_RE.match(name)
+    if not m:
+        return
+    code = m.group(1)
+    from part.models import PartCategory
+    for c in PartCategory.objects.exclude(pk=instance.pk).only('name'):
+        mm = CATEGORY_CODE_RE.match(c.name or '')
+        if mm and mm.group(1) == code:
+            raise ValidationError(
+                f'类别码 {code} 已被「{c.name}」占用，请更换编号')
+
+
 def auto_code_template_options(instance):
     """参数模板选项自动编号：choices 里逗号/分号/换行分隔的选项，
     已带 "NN-" 前缀的保留原码，未带的取下一个可用号。
@@ -549,7 +568,10 @@ def extract_params_from_description(part, overwrite=False):
 
 def on_category_save(sender, instance, **kwargs):
     try:
+        check_category_code_unique(instance)
         auto_code_category(instance)
+    except ValidationError:
+        raise  # 撞码必须阻断保存，不能被吞
     except Exception:
         logger.exception('WeiTiMDM: 类别自动编号失败')
 
@@ -652,8 +674,22 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
         return (Part.objects.filter(IPN=key).first()
                 or Part.objects.filter(name=key).first())
 
+    def _render(self, request, template_name, ctx):
+        """从插件目录直接读模板渲染——不依赖 Django app 模板发现机制。
+
+        插件目录不在 INSTALLED_APPS 里，render() 的模板加载器找不到
+        templates/ 下的文件，所以这里手动读文件 + RequestContext 渲染
+        （RequestContext 提供 csrf_token 等上下文处理器变量）。
+        """
+        from django.http import HttpResponse
+        from django.template import RequestContext, Template
+        path = os.path.join(PLUGIN_DIR, 'templates', 'weiti_mdm',
+                            template_name)
+        with open(path, encoding='utf-8') as f:
+            tpl = Template(f.read())
+        return HttpResponse(tpl.render(RequestContext(request, ctx)))
+
     def view_bom_import(self, request):
-        from django.shortcuts import render
         from django.http import HttpResponseForbidden
         from weiti_mdm import bom_import
 
@@ -669,12 +705,12 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
             parent = self._resolve_parent(request.POST.get('parent'))
             if not f or parent is None:
                 ctx['error'] = '请同时提供 BOM 文件和有效的父零件(ID/IPN/名称)'
-                return render(request, 'weiti_mdm/bom_upload.html', ctx)
+                return self._render(request, 'bom_upload.html', ctx)
             try:
                 headers, rows = bom_import.parse_file(f)
             except Exception as e:
                 ctx['error'] = f'文件解析失败: {e}'
-                return render(request, 'weiti_mdm/bom_upload.html', ctx)
+                return self._render(request, 'bom_upload.html', ctx)
             # session 存纯字符串,避免 JSON 序列化问题
             srows = [{k: ('' if v is None else str(v)) for k, v in r.items()}
                      for r in rows]
@@ -685,7 +721,7 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
             ctx.update({'headers': headers, 'preview': preview,
                         'row_count': len(srows), 'parent': parent,
                         'guess': self._guess_columns(headers)})
-            return render(request, 'weiti_mdm/bom_map.html', ctx)
+            return self._render(request, 'bom_map.html', ctx)
 
         # 步骤3/4：预览(dry-run) 或 提交
         if action in ('preview', 'commit'):
@@ -694,7 +730,7 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
             rows = request.session.get('bom_rows', [])
             if parent is None or not rows:
                 ctx['error'] = '会话已过期，请重新上传'
-                return render(request, 'weiti_mdm/bom_upload.html', ctx)
+                return self._render(request, 'bom_upload.html', ctx)
             mapping = {k: request.POST.get('col_' + k, '')
                        for k in ('name', 'qty', 'ref', 'category', 'spec')}
             if not mapping['name']:
@@ -703,15 +739,15 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
                 ctx.update({'headers': hdrs, 'preview': preview,
                             'row_count': len(rows), 'parent': parent,
                             'error': '必须指定「组件名称」列', 'guess': mapping})
-                return render(request, 'weiti_mdm/bom_map.html', ctx)
+                return self._render(request, 'bom_map.html', ctx)
             dry = (action == 'preview')
             report = bom_import.run_import(parent, rows, mapping, dry_run=dry)
             ctx.update({'report': report, 'parent': parent,
                         'mapping': mapping, 'dry_run': dry})
-            return render(request, 'weiti_mdm/bom_report.html', ctx)
+            return self._render(request, 'bom_report.html', ctx)
 
         # 步骤1：GET → 上传页
-        return render(request, 'weiti_mdm/bom_upload.html', ctx)
+        return self._render(request, 'bom_upload.html', ctx)
 
     @staticmethod
     def _guess_columns(headers):
