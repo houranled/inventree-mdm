@@ -1,0 +1,65 @@
+name: Bug 报告
+about: 报告一个缺陷或异常
+title: "[Bug] "
+labels:
+  - 类型/bug
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 清晰描述遇到的问题
+    validations:
+      required: true
+
+  - type: input
+    id: related_test_case
+    attributes:
+      label: 关联测试用例（如果有）
+      description: 若本缺陷由某测试用例发现，请填其工单编号(工单页面右下角有复制按钮)，如 wt-rd/sw_33085_WT-AI#6；无则留空
+      placeholder: "wt-rd/sw_33085_WT-AI#123"
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: false
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+    validations:
+      required: false
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境
+      value: |
+        - 板卡型号 / 平台：
+        - 固件 / 软件版本（commit 或 tag）：
+        - 摄像头 / 外设型号：
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / 截图
+    validations:
+      required: false
