@@ -1,7 +1,7 @@
 """IPN 自动编码插件（微体科技物料编码）
 
-编码结构: {小类码}-{特征段}-{流水号}
-  例: 201-03011-0001
+编码结构: {小类码}-{规格段}
+  例: 201-030110301
 
 规则说明（编码规则文档仅作格式参考，全部码值由系统自动分配，
            日常操作不需要查文档）:
@@ -9,15 +9,17 @@
      并自动改写名称前缀，如 在「2-结构类」下新建「螺丝」→ 自动变「201-螺丝」
   2. 选项码: 参数模板的选项值自动编号——只写 "金属膜/碳膜"，
      保存后自动变 "01-金属膜/02-碳膜"（已带码的保留并归一化位宽）
-  3. 特征段: 按「类别参数模板的排列顺序」取每个参数值的前缀数字拼接
+  3. 规格段: 按「类别参数模板的排列顺序」取每个参数值的前缀数字拼接
      - 参数值 "03-金属膜电阻" → 取 "03"
      - 参数值 "10K"/"4.7K" 等阻值 → 按 有效数字+10的幂 编码(10K→103, 4.7K→472)
      - 无数字前缀且非阻值 → 兜底 "00"
-     - 参数没填全 → 发 !201-0001 式临时码（!=规格待补），补齐后自动升级正式码
-  4. 流水号: 同「类别码-特征段」前缀下最大流水 +1，4位补零
-  5. 导入兼容: Excel 旧类别名经 keywords 字段自动归类(alias.txt 别名表 +
+     - 参数没填全 → 发 201-03xx103xx 式槽位码（x=待补槽位），
+       补齐后自动升级正式码；导入建件且规格反解不全时加 ! 前缀待复核
+     - 类别没绑参数模板 → 发 201-S0001 式无规格流水码（S=Spec-less，
+       正式码不是临时态，无"待补"概念）
+  4. 导入兼容: Excel 旧类别名经 keywords 字段自动归类(alias.txt 别名表 +
      类别名匹配)；中文单位(个/片/只)自动换算为系统单位(pcs)
-  6. 描述反解参数: 零件保存后(含导入)自动从 description 按类别参数模板匹配参数值,
+  5. 描述反解参数: 零件保存后(含导入)自动从 description 按类别参数模板匹配参数值,
      模板有选项就找选项文本(01-SMD0603/SMD0603/0603 都认),阻值类抽 10K 等;
      写入参数后自动触发 IPN 从临时码升级为正式码。开关: ENABLE_DESC_EXTRACT
 
@@ -40,6 +42,14 @@ logger = logging.getLogger('inventree')
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 ALIAS_FILE = os.path.join(PLUGIN_DIR, 'alias.txt')
 
+# 插件目录是按文件路径加载的，不在 sys.path 中——手动挂上，
+# 使 `import bom_import` 可用；并把本模块登记为 'weiti_mdm'，
+# 供 bom_import.py 内 `from weiti_mdm import xxx` 解析。
+import sys as _sys
+_sys.modules.setdefault('weiti_mdm', _sys.modules[__name__])
+if PLUGIN_DIR not in _sys.path:
+    _sys.path.append(PLUGIN_DIR)
+
 # ------------------------------------------------------------------
 # 常量与正则
 # ------------------------------------------------------------------
@@ -51,7 +61,8 @@ TOP_CODE_RE = re.compile(r'^(\d)[-\s_]+')
 # 参数选项值前缀: "03-金属膜电阻" -> 03
 OPT_CODE_RE = re.compile(r'^(\d+)')
 # IPN 成品格式: {小类码}-{规格段}，规格段=参数码按序拼接(无流水号)，
-# 如 102-030110301；临时码(参数不全): !102-03xx103xx 或 !102-T0001
+# 如 102-030110301；无规格件: 805-S0001(S=Spec-less 流水码)；
+# 临时码(参数不全): !102-03xx103xx
 IPN_RE = re.compile(r'^\d{3}-[0-9A-Za-z]{2,}$')
 IPN_PROV_RE = re.compile(r'^!\d{3}-[0-9A-Za-z]+$')
 
@@ -427,9 +438,10 @@ def assign_ipn(part):
     """给零件生成/修正 IPN。返回 True 表示 IPN 被改写。
 
     - 参数填全 → 正式码 {code}-{feat}（无流水号：同规格同码，天然去重）
-    - 参数部分填 → 临时码 !{code}-{槽位段}，未填槽位用 x 占位
-    - 完全无规格信息 → 占位码 !{code}-T{serial}
-    - 临时码随参数补齐自动升级，最终成为正式码
+    - 参数部分填 → 槽位码 {code}-{槽位段}，未填槽位用 x 占位
+    - 导入建件且规格反解不全 → 槽位码加 ! 前缀（待人工复核标记）
+    - 类别未绑参数模板 → 无规格流水码 {code}-S{serial}（正式码，非临时态）
+    - 参数补齐后自动升级为正式码（! 同时消失）
     """
     code = get_category_code(part)
     if not code:
@@ -447,27 +459,36 @@ def assign_ipn(part):
 
     slots = feature_slots(part)
     if slots:
-        target = f'!{code}-{slots}'
+        # ! 只保留「导入建件且规格反解不全」的待复核标记：
+        # bom_import 建件时会先打好 !，这里靠 cur 保持粘性；
+        # 手工建件参数未填 → 槽位码但不带 !（x 槽位本身已标出缺口）
+        bang = '!' if cur.startswith('!') else ''
+        target = f'{bang}{code}-{slots}'
         if cur == target:
             return False
         part.IPN = target
-        logger.info('WeiTiMDM: %s -> %s (临时码，x=规格槽位待补)',
-                    part.name, part.IPN)
+        logger.info('WeiTiMDM: %s -> %s (%s)', part.name, part.IPN,
+                    '待复核：导入参数反解不全' if bang else '参数未填全')
         return True
 
-    # 类别未绑模板且无参数 → 纯占位码
-    if cur:
+    # 类别未绑定参数模板 → 无规格零件，直接发正式流水码
+    # 旧占位码 !{code}-Tnnnn 视为可迁移格式，重写成 S 码；
+    # 已有 S 码或其他合规码则保持不变
+    if cur and not cur.startswith(f'!{code}-T'):
         return False
     from part.models import Part
-    prefix = f'!{code}-T'
+    prefix = f'{code}-S'
     nums = []
     for ipn in (Part.objects.filter(IPN__startswith=prefix)
                 .values_list('IPN', flat=True)):
         tail = str(ipn)[len(prefix):]
         if tail.isdigit():
             nums.append(int(tail))
-    part.IPN = f'{prefix}{max(nums, default=0) + 1:0{SERIAL_LEN}d}'
-    logger.info('WeiTiMDM: %s -> %s (占位码，规格未录)', part.name, part.IPN)
+    new_ipn = f'{prefix}{max(nums, default=0) + 1:0{SERIAL_LEN}d}'
+    if cur == new_ipn:
+        return False
+    part.IPN = new_ipn
+    logger.info('WeiTiMDM: %s -> %s (无规格件，流水码)', part.name, part.IPN)
     return True
 
 
@@ -692,8 +713,8 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
     NAME = 'WeiTiMDM'
     SLUG = 'weiti_mdm'
     TITLE = '微体物料主数据'
-    DESCRIPTION = ('类别/参数选项自动编号、IPN自动生成({小类码}-{特征段}-{流水号})、'
-                   '导入归类兼容、描述反解参数、BOM一键导入')
+    DESCRIPTION = ('类别/参数选项自动编号、IPN自动生成({小类码}-{规格段}，'
+                   '无规格件用S流水码)、导入归类兼容、描述反解参数、BOM一键导入')
     VERSION = '0.2.0'
     AUTHOR = '微体科技'
 
@@ -738,15 +759,14 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
         """
         from django.http import HttpResponse
         from django.template import RequestContext, Template
-        path = os.path.join(PLUGIN_DIR, 'templates', 'weiti_mdm',
-                            template_name)
+        path = os.path.join(PLUGIN_DIR, 'templates', template_name)
         with open(path, encoding='utf-8') as f:
             tpl = Template(f.read())
         return HttpResponse(tpl.render(RequestContext(request, ctx)))
 
     def view_bom_import(self, request):
         from django.http import HttpResponseForbidden
-        from weiti_mdm import bom_import
+        import bom_import
 
         if not (request.user.is_authenticated and request.user.is_staff):
             return HttpResponseForbidden('需要以员工(staff)身份登录')
@@ -795,10 +815,50 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
                             'row_count': len(rows), 'parent': parent,
                             'error': '必须指定「组件名称」列', 'guess': mapping})
                 return self._render(request, 'bom_map.html', ctx)
-            dry = (action == 'preview')
-            report = bom_import.run_import(parent, rows, mapping, dry_run=dry)
+            if action == 'preview':
+                report = bom_import.run_import(parent, rows, mapping,
+                                               dry_run=True)
+                ctx.update({'report': report, 'parent': parent,
+                            'mapping': mapping, 'dry_run': True})
+                # 缺失类别清单 → 报告页里给下拉让用户决策
+                missing = bom_import.missing_categories(
+                    rows, mapping['category'])
+                if missing:
+                    from part.models import PartCategory
+                    ctx['missing'] = missing
+                    ctx['cats'] = [(c.pk, c.name) for c in
+                                   PartCategory.objects.order_by('name')]
+                    ctx['tops'] = [(c.pk, c.name) for c in
+                                   PartCategory.objects.filter(
+                                       parent=None).order_by('name')]
+                return self._render(request, 'bom_report.html', ctx)
+
+            # commit：先落实用户在预览页选的类别决策，再导 BOM
+            category_map = {}
+            missing = bom_import.missing_categories(rows, mapping['category'])
+            if missing:
+                from part.models import PartCategory
+                for i, raw in enumerate(missing):
+                    dec = request.POST.get(f'catdec_{i}', 'skip')
+                    try:
+                        if dec.startswith('new:'):
+                            p = PartCategory.objects.filter(
+                                pk=int(dec[4:])).first()
+                            nc = PartCategory(name=raw, parent=p)
+                            nc.save()  # 插件信号自动编号 + 号段校验
+                            category_map[raw] = nc.name
+                        elif dec.startswith('map:'):
+                            ec = PartCategory.objects.filter(
+                                pk=int(dec[4:])).first()
+                            if ec:
+                                category_map[raw] = ec.name
+                    except Exception:
+                        logger.exception('WeiTiMDM.bom: 类别决策失败 %s', raw)
+            report = bom_import.run_import(
+                parent, rows, mapping, dry_run=False,
+                category_map=category_map)
             ctx.update({'report': report, 'parent': parent,
-                        'mapping': mapping, 'dry_run': dry})
+                        'mapping': mapping, 'dry_run': False})
             return self._render(request, 'bom_report.html', ctx)
 
         # 步骤1：GET → 上传页

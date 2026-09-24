@@ -66,6 +66,36 @@
     <input type="hidden" name="col_ref" value="{{ mapping.ref }}">
     <input type="hidden" name="col_category" value="{{ mapping.category }}">
     <input type="hidden" name="col_spec" value="{{ mapping.spec }}">
+
+    {% if missing %}
+    <h2 style="font-size:16px;margin-top:20px;">
+      以下类别在系统中不存在（{{ missing|length }} 个）—— 请逐个选择处理方式
+    </h2>
+    <table>
+      <tr><th>Excel 中的类别</th><th>处理方式</th></tr>
+      {% for c in missing %}
+      <tr>
+        <td><b>{{ c }}</b></td>
+        <td>
+          <select name="catdec_{{ forloop.counter0 }}" style="min-width:260px;">
+            <option value="skip">不归类（零件照建，IPN 暂缓）</option>
+            <optgroup label="新建到小类所在大类下（自动编号）">
+              {% for pk, nm in tops %}
+              <option value="new:{{ pk }}">新建到 {{ nm }}</option>
+              {% endfor %}
+            </optgroup>
+            <optgroup label="映射到已有类别">
+              {% for pk, nm in cats %}
+              <option value="map:{{ pk }}">{{ nm }}</option>
+              {% endfor %}
+            </optgroup>
+          </select>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+
     <button class="btn" type="submit">确认导入（写入数据库）</button>
     <a class="plain" href="./">取消 / 重新上传</a>
   </form>

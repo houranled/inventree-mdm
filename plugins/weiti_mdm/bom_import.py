@@ -134,6 +134,18 @@ def resolve_category(category_text):
         return None
 
 
+def missing_categories(rows, col_cat):
+    """收集类别列里匹配不到系统类别的文本（去重、保持出现顺序）。"""
+    seen, out = set(), []
+    for row in rows:
+        raw = cell(row, col_cat)
+        if raw and raw not in seen:
+            seen.add(raw)
+            if resolve_category(raw) is None:
+                out.append(raw)
+    return out
+
+
 def get_or_create_part(name, spec_text, category_text, dry_run):
     """返回 (part_or_None, action, note)。action: reused/created/would_create。"""
     category = resolve_category(category_text)
@@ -157,6 +169,12 @@ def get_or_create_part(name, spec_text, category_text, dry_run):
     # 保存触发插件信号 → 归类 + IPN + 描述反解参数
     part.save()
     part.refresh_from_db()
+    # 导入建件且规格反解不全（IPN 槽位码含 x 占位）→ 加 ! 前缀待人工复核
+    ipn = part.IPN or ''
+    if 'x' in ipn and not ipn.startswith('!'):
+        part.IPN = '!' + ipn
+        part.save(update_fields=['IPN'])
+        part.refresh_from_db()
     return part, 'created', f'新建 #{part.pk} {part.IPN or ""}'.strip()
 
 
@@ -188,10 +206,11 @@ def add_bom_item(parent, sub_part, quantity, reference, note, dry_run):
 # 主流程
 # ------------------------------------------------------------------
 
-def run_import(parent_part, rows, mapping, dry_run=True):
+def run_import(parent_part, rows, mapping, dry_run=True, category_map=None):
     """执行 BOM 导入。
 
     mapping: {'name':列名, 'qty':列名, 'ref':列名, 'category':列名, 'spec':列名}
+    category_map: {Excel原类别文本: 目标类别名}，用户在预览页确认的类别决策
     返回汇总 dict。
     """
     from django.db import transaction
@@ -213,7 +232,8 @@ def run_import(parent_part, rows, mapping, dry_run=True):
             if not name:
                 continue
             spec = cell(row, col_spec)
-            cat = cell(row, col_cat)
+            cat_raw = cell(row, col_cat)
+            cat = (category_map or {}).get(cat_raw, cat_raw)
             qty = cell(row, col_qty) or '1'
             ref = cell(row, col_ref)
 
