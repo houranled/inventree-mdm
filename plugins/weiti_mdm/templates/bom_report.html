@@ -65,7 +65,7 @@
     <input type="hidden" name="col_qty" value="{{ mapping.qty }}">
     <input type="hidden" name="col_ref" value="{{ mapping.ref }}">
     <input type="hidden" name="col_category" value="{{ mapping.category }}">
-    <input type="hidden" name="col_spec" value="{{ mapping.spec }}">
+    {% for s in mapping.spec %}<input type="hidden" name="col_spec" value="{{ s }}">{% endfor %}
 
     {% if missing %}
     <h2 style="font-size:16px;margin-top:20px;">

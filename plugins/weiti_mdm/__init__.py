@@ -793,9 +793,11 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
             request.session['bom_rows'] = srows
             request.session['bom_parent'] = parent.pk
             preview = [[r.get(h, '') for h in headers] for r in srows[:8]]
+            guess = self._guess_columns(headers)
             ctx.update({'headers': headers, 'preview': preview,
                         'row_count': len(srows), 'parent': parent,
-                        'guess': self._guess_columns(headers)})
+                        'guess': guess,
+                        'spec_sel': [guess['spec']] if guess['spec'] else []})
             return self._render(request, 'bom_map.html', ctx)
 
         # 步骤3/4：预览(dry-run) 或 提交
@@ -807,13 +809,16 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
                 ctx['error'] = '会话已过期，请重新上传'
                 return self._render(request, 'bom_upload.html', ctx)
             mapping = {k: request.POST.get('col_' + k, '')
-                       for k in ('name', 'qty', 'ref', 'category', 'spec')}
+                       for k in ('name', 'qty', 'ref', 'category')}
+            # 规格列允许多选：存列表，run_import 里按序拼接
+            mapping['spec'] = [s for s in request.POST.getlist('col_spec') if s]
             if not mapping['name']:
                 hdrs = request.session.get('bom_headers', [])
                 preview = [[r.get(h, '') for h in hdrs] for r in rows[:8]]
                 ctx.update({'headers': hdrs, 'preview': preview,
                             'row_count': len(rows), 'parent': parent,
-                            'error': '必须指定「组件名称」列', 'guess': mapping})
+                            'error': '必须指定「组件名称」列', 'guess': mapping,
+                            'spec_sel': mapping['spec']})
                 return self._render(request, 'bom_map.html', ctx)
             if action == 'preview':
                 report = bom_import.run_import(parent, rows, mapping,

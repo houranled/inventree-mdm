@@ -47,11 +47,11 @@
           </select>
         </div>
         <div>
-          <label>规格型号列（写入描述 + 反解参数）</label>
-          <select name="col_spec">
-            <option value="">— 无 —</option>
-            {% for h in headers %}<option value="{{ h }}" {% if guess.spec == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
+          <label>规格型号列（可多选，按列序拼接为描述）</label>
+          <select name="col_spec" multiple size="5" style="height:auto;">
+            {% for h in headers %}<option value="{{ h }}" {% if h in spec_sel %}selected{% endif %}>{{ h }}</option>{% endfor %}
           </select>
+          <p class="hint">按住 Ctrl 多选；多列内容按表格列顺序用「;」拼接</p>
         </div>
         <div>
           <label>类别列（用于新建零件归类）</label>

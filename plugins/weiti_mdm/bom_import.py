@@ -113,9 +113,14 @@ def find_existing_part(name, category, spec_text):
             existing_feat = None
         if incoming_feat == existing_feat:
             return p
-    # 有同名但特征都不匹配：若来料无法算特征，退回复用第一个同名件（避免重复建同名）
+    # 有同名但特征都不匹配：来料无法算特征时，再按规格文本比对——
+    # 同名且规格相同才复用；规格不同视为不同零件(如线缆同名不同长度/接口)
     if incoming_feat is None:
-        return same_name[0]
+        if not spec_text:
+            return same_name[0]
+        for p in same_name:
+            if (p.description or '').strip() == spec_text.strip():
+                return p
     return None
 
 
@@ -219,7 +224,9 @@ def run_import(parent_part, rows, mapping, dry_run=True, category_map=None):
     col_qty = mapping.get('qty')
     col_ref = mapping.get('ref')
     col_cat = mapping.get('category')
-    col_spec = mapping.get('spec')
+    # 规格列可为单列名或列名列表（多列按序拼接为规格文本）
+    _spec = mapping.get('spec')
+    spec_cols = _spec if isinstance(_spec, list) else ([_spec] if _spec else [])
 
     report = {
         'created': 0, 'reused': 0, 'bom_rows': 0,
@@ -231,7 +238,8 @@ def run_import(parent_part, rows, mapping, dry_run=True, category_map=None):
             name = cell(row, col_name)
             if not name:
                 continue
-            spec = cell(row, col_spec)
+            spec = '; '.join(v for v in
+                             (cell(row, c) for c in spec_cols) if v)
             cat_raw = cell(row, col_cat)
             cat = (category_map or {}).get(cat_raw, cat_raw)
             qty = cell(row, col_qty) or '1'
