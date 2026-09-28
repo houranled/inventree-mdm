@@ -994,7 +994,12 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                     ctx['error'] = ('父零件无效：填写了 ID/IPN/名称'
                                     '但找不到对应零件')
                     return self._render(request, 'bom_upload.html', ctx)
-                sheets = sheets[:1]   # 指定父零件 → 只导第一个工作表
+                # 指定父零件 → 每个工作表各建一个子装配件挂到它下面
+                if not fixed_parent.assembly:
+                    fixed_parent.assembly = True
+                    fixed_parent.save(update_fields=['assembly'])
+            request.session['bom_fixed'] = (
+                fixed_parent.pk if fixed_parent else '')
 
             # 工作目录：行数据(JSON) + 图片都落盘，session 只存元信息
             work = os.path.join(dj_settings.MEDIA_ROOT, 'tmp',
@@ -1003,16 +1008,18 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
             meta = []
             sheets_view = []
             for idx, s in enumerate(sheets):
-                if fixed_parent is not None:
-                    pp, pa = fixed_parent, None
-                else:
-                    # 父零件留空 → 按各表名自动定位/创建成品类装配体
-                    pp, pa = bom_import.auto_parent_part(s['sheet'])
-                if pp is None:
+                # 每个工作表按表名定位/待建一个（子）装配体，只探测不落库
+                probe, pname = bom_import.probe_parent_part(s['sheet'])
+                if not pname:
                     shutil.rmtree(work, ignore_errors=True)
                     ctx['error'] = (f'工作表「{s["sheet"]}」名称无法生成'
                                     '零件名，请手动指定父零件')
                     return self._render(request, 'bom_upload.html', ctx)
+                if probe:
+                    parent_pk, pipn, pa = probe.pk, probe.IPN or '', 'reused'
+                    pname = probe.name
+                else:
+                    parent_pk, pipn, pa = None, '', 'will_create'
                 srows = [{k: ('' if v is None else str(v))
                           for k, v in r.items()} for r in s['rows']]
                 with open(os.path.join(work, f'sheet_{idx}.json'),
@@ -1021,16 +1028,16 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                               fh, ensure_ascii=False)
                 meta.append({
                     'sheet': s['sheet'], 'json': f'sheet_{idx}.json',
-                    'parent_pk': pp.pk, 'pname': pp.name,
-                    'pipn': pp.IPN or '', 'auto': pa,
+                    'parent_pk': parent_pk, 'pname': pname,
+                    'pipn': pipn, 'auto': pa,
                     'rows': len(srows),
                     'imgs': bom_import.stash_images(
                         s['images'], work, prefix=f's{idx}_')})
                 g = self._guess_columns(s['headers'])
                 sheets_view.append({
                     'idx': idx, 'sheet': s['sheet'], 'headers': s['headers'],
-                    'parent_pk': pp.pk, 'pname': pp.name,
-                    'pipn': pp.IPN or '', 'auto': pa, 'rows': len(srows),
+                    'parent_pk': parent_pk, 'pname': pname,
+                    'pipn': pipn, 'auto': pa, 'rows': len(srows),
                     'preview': [[r.get(h, '') for h in s['headers']]
                                 for r in srows[:3]],
                     'guess': g,
@@ -1063,12 +1070,17 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
             all_rows = [r for _m, _h, rows, _i in sheet_data for r in rows]
 
             # 每个工作表独立一套列映射：字段名带 _{idx} 后缀
+            # 位号列不做映射配置：逐表按关键词自动识别
+            ref_kw = ('位号', 'ref', 'designator')
             mappings = []
-            for idx in range(len(sheet_data)):
+            for idx, (_m, hdrs, _rows, _i) in enumerate(sheet_data):
                 mp = {k: request.POST.get(f'col_{k}_{idx}', '')
-                      for k in ('name', 'qty', 'ref', 'category')}
+                      for k in ('name', 'qty', 'category')}
                 mp['spec'] = [s for s in
                               request.POST.getlist(f'col_spec_{idx}') if s]
+                mp['ref'] = next(
+                    (h for h in hdrs
+                     if any(k in str(h).lower() for k in ref_kw)), '')
                 mappings.append(mp)
             if any(not mp['name'] for mp in mappings):
                 # 重渲染映射页，保留用户已选的列
@@ -1085,6 +1097,7 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                         'guess': mp, 'spec_sel': mp['spec']})
                 ctx.update({'sheets_view': sheets_view,
                             'row_count': len(all_rows),
+                            'parent': fixed_obj,
                             'error': '每个工作表都必须指定「组件名称」列'})
                 return self._render(request, 'bom_map.html', ctx)
 
@@ -1098,27 +1111,86 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                             miss.append(c)
                 return miss
 
+            fixed_pk = request.session.get('bom_fixed') or ''
+            fixed_obj = (self._resolve_parent(str(fixed_pk))
+                         if fixed_pk else None)
+
             def run_all(dry):
-                """逐工作表跑 run_import，汇总报告。"""
+                """逐工作表跑 run_import，汇总报告 + 按表分组明细。
+
+                自动父零件在这里才真正创建：dry 时包在外层事务里随
+                _Rollback 回滚；commit 时正常落库。
+                指定了顶层父零件时，每个表名生成的子装配件再挂一行
+                BOM 到该父零件。
+                """
+                from django.db import transaction
                 rep = {'created': 0, 'reused': 0, 'bom_rows': 0,
-                       'failed': 0, 'lines': []}
-                for idx, (m, _h, rows, imgs) in enumerate(sheet_data):
-                    pp = self._resolve_parent(str(m['parent_pk']))
+                       'failed': 0, 'groups': []}
+
+                def run_sheet(m, rows, imgs, mp):
+                    pp = (self._resolve_parent(str(m['parent_pk']))
+                          if m['parent_pk'] else None)
                     if pp is None:
-                        rep['failed'] += 1
-                        rep['lines'].append({
-                            'row': '-', 'name': m['sheet'],
-                            'action': 'error', 'ok': False,
-                            'note': '父零件不存在'})
-                        continue
+                        pp, _act = bom_import.auto_parent_part(m['sheet'])
+                    if pp is None:
+                        return None
                     sub = bom_import.run_import(
-                        pp, rows, mappings[idx], dry_run=dry, images=imgs,
+                        pp, rows, mp, dry_run=dry, images=imgs,
                         category_map=run_all.category_map)
+                    if fixed_obj is not None:
+                        if fixed_obj.pk == pp.pk:
+                            sub['failed'] += 1
+                            sub['lines'].insert(0, {
+                                'row': '—', 'name': m['pname'],
+                                'action': 'error', 'cat': '',
+                                'note': '子装配件与父零件同名，跳过挂载',
+                                'ok': False})
+                        else:
+                            try:
+                                ok, msg = bom_import.add_bom_item(
+                                    fixed_obj, pp, '1', '',
+                                    f'由工作表「{m["sheet"]}」导入', dry)
+                            except Exception as e:
+                                # 如循环挂载等校验错误：记为失败行，不中断整体
+                                ok, msg = False, str(e)
+                            if ok:
+                                sub['bom_rows'] += 1
+                                note = f'作为子装配挂到 {fixed_obj.name} x1'
+                            else:
+                                sub['failed'] += 1
+                                note = (f'挂载到 {fixed_obj.name} 失败：{msg}'
+                                        '（可能存在循环引用，请检查该零件的'
+                                        ' BOM 子树中是否已包含父零件）')
+                            sub['lines'].insert(0, {
+                                'row': '—', 'name': m['pname'],
+                                'action': 'link' if ok else 'error',
+                                'cat': '', 'note': note, 'ok': ok})
+                    return sub
+
+                for idx, (m, _h, rows, imgs) in enumerate(sheet_data):
+                    if dry:
+                        try:
+                            with transaction.atomic():
+                                sub = run_sheet(m, rows, imgs,
+                                                mappings[idx])
+                                raise bom_import._Rollback()
+                        except bom_import._Rollback:
+                            pass
+                    else:
+                        sub = run_sheet(m, rows, imgs, mappings[idx])
+                    if sub is None:
+                        sub = {'created': 0, 'reused': 0, 'bom_rows': 0,
+                               'failed': 1,
+                               'lines': [{'row': '-', 'name': m['sheet'],
+                                          'action': 'error', 'cat': '',
+                                          'note': '父零件不存在',
+                                          'ok': False}]}
+                    rep['groups'].append({
+                        'sheet': m['sheet'], 'parent_pk': m['parent_pk'],
+                        'pname': m['pname'], 'pipn': m['pipn'],
+                        'auto': m['auto'], 'sub': sub})
                     for k in ('created', 'reused', 'bom_rows', 'failed'):
                         rep[k] += sub[k]
-                    for ln in sub['lines']:
-                        ln['note'] = f"[{m['sheet']}] {ln['note']}"
-                    rep['lines'].extend(sub['lines'])
                 return rep
             run_all.category_map = {}
 
@@ -1132,17 +1204,22 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                     for s in mp['spec']:
                         mfields.append((f'col_spec_{idx}', s))
                 ctx.update({'report': report, 'sheets': meta,
+                            'parent': fixed_obj,
                             'mfields': mfields, 'dry_run': True})
                 # 缺失类别清单 → 报告页里给下拉让用户决策
                 missing = collect_missing()
                 if missing:
                     from part.models import PartCategory
+                    tops_qs = PartCategory.objects.filter(
+                        parent=None).order_by('name')
                     ctx['missing'] = missing
-                    ctx['cats'] = [(c.pk, c.name) for c in
-                                   PartCategory.objects.order_by('name')]
-                    ctx['tops'] = [(c.pk, c.name) for c in
-                                   PartCategory.objects.filter(
-                                       parent=None).order_by('name')]
+                    ctx['tops'] = [(c.pk, c.name) for c in tops_qs]
+                    # 大类→小类的树，用于分级下拉：大类只作分组标题不可选
+                    ctx['cat_tree'] = [
+                        (t.name, [(c.pk, c.name) for c in
+                                  PartCategory.objects.filter(
+                                      parent=t).order_by('name')])
+                        for t in tops_qs]
                 return self._render(request, 'bom_report.html', ctx)
 
             # commit：先落实用户在预览页选的类别决策，再导 BOM
@@ -1169,9 +1246,10 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
             # 提交后清理工作目录（JSON + 图片）
             request.session.pop('bom_work', None)
             request.session.pop('bom_sheets', None)
+            request.session.pop('bom_fixed', None)
             shutil.rmtree(work, ignore_errors=True)
             ctx.update({'report': report, 'sheets': meta,
-                        'dry_run': False})
+                        'parent': fixed_obj, 'dry_run': False})
             return self._render(request, 'bom_report.html', ctx)
 
         # 步骤1：GET → 上传页
@@ -1179,22 +1257,30 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
 
     @staticmethod
     def _guess_columns(headers):
-        """按列名关键词猜测默认映射。"""
+        """按列名关键词猜测默认映射。
+
+        kw 的值是"优先级分组"：组内关键词同级，先扫完第一组
+        所有表头都没命中，才退到下一组。如 category 先找「类别」，
+        找不到再找「类型」。
+        """
         guess = {'name': '', 'qty': '', 'ref': '', 'category': '', 'spec': ''}
         kw = {
-            'name': ['物料名称', '名称', '组件', '零件', 'name'],
-            'qty': ['数量', '用量', 'qty', 'quantity'],
-            'ref': ['位号', '编号', '序号', 'ref', 'designator'],
-            'category': ['类别', '分类', 'category'],
-            'spec': ['规格', '型号', '规格型号', 'spec', 'description', '描述'],
+            'name': [['物料名称', '名称', '组件', '零件', 'name']],
+            'qty': [['数量', '用量', 'qty', 'quantity']],
+            'ref': [['位号', '编号', '序号', 'ref', 'designator']],
+            'category': [['类别', '分类', 'category'], ['类型', 'type']],
+            'spec': [['规格', '型号', '规格型号', 'spec', 'description',
+                      '描述']],
         }
-        for h in headers:
-            low = str(h).lower()
-            for field, words in kw.items():
+        for field, groups in kw.items():
+            for words in groups:
+                for h in headers:
+                    low = str(h).lower()
+                    if any(w.lower() in low for w in words):
+                        guess[field] = h
+                        break
                 if guess[field]:
-                    continue
-                if any(w.lower() in low for w in words):
-                    guess[field] = h
+                    break
         return guess
 
 

@@ -25,6 +25,7 @@
 <body>
   {% if parent %}
   <h1>映射列 — 父零件：{{ parent.name }} {% if parent.IPN %}({{ parent.IPN }}){% endif %}</h1>
+  <p class="hint">每个工作表将按表名各建/复用一个<b>子装配件</b>，作为 BOM 行挂到该父零件下。</p>
   {% else %}
   <h1>映射列 — 共 {{ sheets_view|length }} 个工作表</h1>
   {% endif %}
@@ -37,8 +38,8 @@
     <input type="hidden" name="action" value="preview">
     {% for s in sheets_view %}
     <div class="card">
-      <h2 class="sheet">「{{ s.sheet }}」 → #{{ s.parent_pk }} {{ s.pname }}{% if s.pipn %} ({{ s.pipn }}){% endif %}
-        {% if s.auto == 'created' %}<b>[新建]</b>{% elif s.auto == 'reused' %}<b>[复用]</b>{% endif %}
+      <h2 class="sheet">「{{ s.sheet }}」 → {% if s.parent_pk %}#{{ s.parent_pk }} {% endif %}{{ s.pname }}{% if s.pipn %} ({{ s.pipn }}){% endif %}
+        {% if s.auto == 'reused' %}<b>[复用已有零件]</b>{% elif s.auto %}<b>[提交时新建]</b>{% endif %}
         — {{ s.rows }} 行</h2>
       <div class="grid">
         <div>
@@ -69,14 +70,8 @@
             {% for h in s.headers %}<option value="{{ h }}" {% if s.guess.category == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
           </select>
         </div>
-        <div>
-          <label>位号列（BOM reference）</label>
-          <select name="col_ref_{{ s.idx }}">
-            <option value="">— 无 —</option>
-            {% for h in s.headers %}<option value="{{ h }}" {% if s.guess.ref == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
-          </select>
-        </div>
       </div>
+      <p class="hint">位号列自动识别：表头含「位号 / ref / designator」的列会自动写入 BOM 位号，无需配置。</p>
       <h3 class="hint">数据预览（前 {{ s.preview|length }} 行）</h3>
       <table>
         <tr>{% for h in s.headers %}<th>{{ h }}</th>{% endfor %}</tr>

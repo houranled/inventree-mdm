@@ -32,11 +32,12 @@
 
       <label>父零件（顶层产品 / 装配体）</label>
       <input type="text" name="parent" value="{{ prefill }}" placeholder="零件 ID、IPN 或 名称；留空按表名自动建成品">
-      <div class="hint">留空 → 用工作表名自动创建成品类父零件（去掉 "BOM" 及之后内容，如「间隙传感器BOM清单」→ 间隙传感器）。BOM 的所有行都会挂到这个父零件下。</div>
+      <div class="hint">留空 → 每个工作表按表名（去掉 "BOM" 及之后内容）各建成一个成品父零件，行挂到各自下面。<br>
+      填写 → 每个工作表按表名各建一个<b>子装配件</b>挂到该父零件 BOM 下，行挂到各子装配件下。</div>
 
       <label>BOM 文件（.xlsx / .xls / .csv）</label>
       <input type="file" name="file" accept=".xlsx,.xls,.csv" required>
-      <div class="hint">第一行须为列标题；支持多工作表——父零件留空时每个 tab 各导成一个 BOM。单元格里的嵌入图片会一并导入。</div>
+      <div class="hint">第一行须为列标题；支持多工作表，每个 tab 对应一个（子）装配体。单元格里的嵌入图片会一并导入。</div>
 
       <button class="btn" type="submit">下一步：映射列</button>
     </form>

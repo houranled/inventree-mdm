@@ -16,39 +16,96 @@ logger = logging.getLogger('inventree')
 # 文件解析
 # ------------------------------------------------------------------
 
-def _sheet_table(ws):
-    """读一个 worksheet → (headers, rows)。空行跳过。"""
+# 表头行自动识别用的关键词（命中越多越像表头）
+HEADER_HINTS = ('名称', '物料', '规格', '型号', '数量', '用量', '类别', '分类',
+                '位号', '编号', '序号', '图片', '材料', '材质', '备注', '单位',
+                '品牌', '供应商', '单价')
+
+
+def _is_num(v):
+    if isinstance(v, (int, float)):
+        return True
+    try:
+        float(str(v))
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _header_score(row):
+    """给一行打"像不像表头"的分。>=0 候选，<0 直接淘汰。"""
+    cells = [str(c).strip() for c in row
+             if c is not None and str(c).strip() != '']
+    if len(cells) < 2:                      # 标题行/合并行一般只有 1 格
+        return -1
+    kw = sum(1 for c in cells
+             if any(k in c.lower() for k in HEADER_HINTS))
+    numeric = sum(1 for c in cells if _is_num(c))
+    dups = len(cells) - len(set(cells))     # 表头一般不重名
+    return kw * 3 + len(cells) - numeric * 2 - dups * 2
+
+
+def _data_row(headers, r):
+    return {headers[i]: r[i] if i < len(r) else None
+            for i in range(len(headers))}
+
+
+def _sheet_table(ws, scan=3):
+    """读一个 worksheet → (headers, rows, header_row)。
+
+    表头在前 scan 行内自动识别（评分最高者，同分取靠前），
+    兼容首行是表格标题/说明文字的情况。header_row 为 1 基 Excel 行号。
+    """
     it = ws.iter_rows(values_only=True)
-    headers = [str(c).strip() if c is not None else '' for c in next(it, [])]
+    head_zone = []
+    for _ in range(scan):
+        r = next(it, None)
+        if r is None:
+            break
+        head_zone.append(list(r))
+    if not head_zone:
+        return [], [], 1
+    best_i, best_s = 0, -1
+    for i, r in enumerate(head_zone):
+        s = _header_score(r)
+        if s > best_s:
+            best_i, best_s = i, s
+    if best_s < 0:
+        return [], [], 1                    # 前 scan 行都不像表头 → 空表
+    headers = [str(c).strip() if c is not None else ''
+               for c in head_zone[best_i]]
     rows = []
-    for r in it:
-        if all(c is None or str(c).strip() == '' for c in r):
-            continue
-        rows.append({headers[i]: r[i] if i < len(r) else None
-                     for i in range(len(headers))})
-    return headers, rows
+    for r in head_zone[best_i + 1:]:        # 表头之后、scan 区内的行
+        if not all(c is None or str(c).strip() == '' for c in r):
+            rows.append(_data_row(headers, r))
+    for r in it:                            # scan 区之后的行
+        if not all(c is None or str(c).strip() == '' for c in r):
+            rows.append(_data_row(headers, r))
+    return headers, rows, best_i + 1
 
 
-def _sheet_images(ws, zf):
-    """一个 worksheet 的全部图片：浮动锚点图 + WPS 单元格嵌入图。"""
+def _sheet_images(ws, zf, header_row=1):
+    """一个 worksheet 的全部图片：浮动锚点图 + WPS 单元格嵌入图。
+    header_row：表头所在 Excel 行号(1基)，图片行号 = Excel行号 - header_row。"""
     out = {}
     for img in getattr(ws, '_images', []):
         try:
-            row = img.anchor._from.row
+            drow = img.anchor._from.row + 1 - header_row
             fmt = getattr(img, 'format', None) or 'png'
             data = img._data()
         except Exception:
             continue
-        if row >= 1 and data:
-            out.setdefault(row, (f'row_{row}.{fmt}', data))
-    for k, v in _wps_cell_images(ws, zf).items():
+        if drow >= 1 and data:
+            out.setdefault(drow, (f'row_{drow}.{fmt}', data))
+    for k, v in _wps_cell_images(ws, zf, header_row).items():
         out.setdefault(k, v)
     return out
 
 
-def _wps_cell_images(ws, zf):
+def _wps_cell_images(ws, zf, header_row=1):
     """WPS 单元格嵌入图：图片在 xl/cellimages.xml，单元格以
     =DISPIMG("ID_xxx",1) 公式引用。返回 {数据行号(1起): (文件名, 字节)}。
+    header_row：表头所在 Excel 行号(1基)。
     """
     import xml.etree.ElementTree as ET
 
@@ -79,7 +136,7 @@ def _wps_cell_images(ws, zf):
         if name and rid:
             id2rid[name] = rid
 
-    # 单元格公式 -> 行号（openpyxl cell.row 为1基，表头=1 → 数据行号 = row-1）
+    # 单元格公式 -> 行号（openpyxl cell.row 为1基 → 数据行号 = row - header_row）
     out = {}
     for row in ws.iter_rows():
         for c in row:
@@ -90,10 +147,10 @@ def _wps_cell_images(ws, zf):
             if not m:
                 continue
             path = rels.get(id2rid.get(m.group(1), ''), '')
-            if path and path in zf.namelist():
+            drow = c.row - header_row
+            if path and path in zf.namelist() and drow >= 1:
                 fmt = path.rsplit('.', 1)[-1]
-                out.setdefault(c.row - 1, (f'row_{c.row - 1}.{fmt}',
-                                           zf.read(path)))
+                out.setdefault(drow, (f'row_{drow}.{fmt}', zf.read(path)))
     return out
 
 
@@ -128,11 +185,12 @@ def parse_all_sheets(django_file):
         out = []
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
             for ws in wb.worksheets:
-                headers, rows = _sheet_table(ws)
+                headers, rows, hrow = _sheet_table(ws)
                 if not headers or not rows:
                     continue
                 out.append({'sheet': ws.title, 'headers': headers,
-                            'rows': rows, 'images': _sheet_images(ws, zf)})
+                            'rows': rows,
+                            'images': _sheet_images(ws, zf, hrow)})
         return out
 
     # xls / csv 走 tablib
@@ -247,6 +305,16 @@ def finished_goods_category():
     return cats[0] if cats else None
 
 
+def probe_parent_part(sheet_name):
+    """只探测不落库：按表名清洗零件名并查重。
+    返回 (已有零件|None, 清洗后的名称)。名称为空串表示无法生成。"""
+    from part.models import Part
+    name = part_name_from_source(sheet_name)
+    if not name:
+        return None, ''
+    return Part.objects.filter(name=name).first(), name
+
+
 def auto_parent_part(sheet_name):
     """父零件留空时按表名定位/自动创建成品类装配体。
 
@@ -271,6 +339,11 @@ def auto_parent_part(sheet_name):
     # 保存触发插件信号 → 类别内参数模板决定正式码或 ! 待完善码
     part.save()
     part.refresh_from_db()
+    # 复制类别参数模板（API 建件时 serializer 做的事，直建 ORM 要自己补）
+    try:
+        part.copy_category_parameters(part.category)
+    except Exception:
+        logger.exception('WeiTiMDM.bom: 复制类别参数模板失败 %s', name)
     return part, 'created'
 
 
@@ -342,6 +415,11 @@ def get_or_create_part(name, spec_text, category_text, dry_run,
     # 这里无需再手工补 !。
     part.save()
     part.refresh_from_db()
+    # 复制类别参数模板（API 建件时 serializer 做的事，直建 ORM 要自己补）
+    try:
+        part.copy_category_parameters(part.category)
+    except Exception:
+        logger.exception('WeiTiMDM.bom: 复制类别参数模板失败 %s', name)
     note = f'新建 #{part.pk} {part.IPN or ""}'.strip()
     img_note = attach_image(part, image_path, dry_run)
     return part, 'created', note + (f'；{img_note}' if img_note else '')
@@ -431,8 +509,17 @@ def run_import(parent_part, rows, mapping, dry_run=True, category_map=None,
                     report['bom_rows'] += 1
                     bom_msg = f'将挂 {name} x{qty}'
 
+                # 展示用类别名：已有件取实际类别，待建件取解析后的类别
+                cat_disp = ''
+                if part is not None:
+                    if part.category:
+                        cat_disp = part.category.name
+                elif cat:
+                    rc = resolve_category(cat)
+                    cat_disp = rc.name if rc else f'{cat}?'
                 report['lines'].append({
                     'row': i, 'name': name, 'action': action,
+                    'cat': cat_disp,
                     'note': note + (f'；{bom_msg}' if bom_msg else ''),
                     'ok': True,
                 })
@@ -441,7 +528,7 @@ def run_import(parent_part, rows, mapping, dry_run=True, category_map=None,
                 report['failed'] += 1
                 report['lines'].append({
                     'row': i, 'name': name, 'action': 'error',
-                    'note': str(e), 'ok': False,
+                    'cat': '', 'note': str(e), 'ok': False,
                 })
 
     if dry_run:

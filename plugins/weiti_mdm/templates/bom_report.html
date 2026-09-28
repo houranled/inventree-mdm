@@ -19,7 +19,11 @@
     .created { background: #e6f4ea; color: #137333; }
     .reused { background: #e8f0fe; color: #1967d2; }
     .error { background: #fce8e6; color: #c5221f; }
+    .link { background: #f3e8fd; color: #6b21a8; }
     .banner { padding: 12px 16px; border-radius: 6px; margin: 12px 0; }
+    h2.grp { font-size: 15px; margin: 22px 0 4px; padding-top: 12px;
+             border-top: 2px solid #e2e2e2; }
+    .hint { color: #888; font-size: 13px; margin: 4px 0; }
     .dry { background: #fef7e0; color: #7a5900; }
     .done { background: #e6f4ea; color: #137333; }
     .btn { background: #137333; color: #fff; border: 0; padding: 10px 20px;
@@ -32,13 +36,8 @@
   <h1>BOM 导入{% if dry_run %} — 预览（未落库）{% else %} — 已完成{% endif %}</h1>
   {% if parent %}
   <p>父零件：<b>{{ parent.name }}</b>{% if parent.IPN %} ({{ parent.IPN }}){% endif %}</p>
-  {% elif sheets %}
-  <p>共 {{ sheets|length }} 个工作表：</p>
-  <ul>
-    {% for s in sheets %}
-    <li>「{{ s.sheet }}」 → #{{ s.parent_pk }} {{ s.pname }}{% if s.pipn %} ({{ s.pipn }}){% endif %}</li>
-    {% endfor %}
-  </ul>
+  {% elif report.groups %}
+  <p>共 {{ report.groups|length }} 个工作表，各导入为一个父零件的 BOM：</p>
   {% endif %}
 
   {% if dry_run %}
@@ -54,17 +53,24 @@
     <div><b>{{ report.failed }}</b>失败</div>
   </div>
 
+  {% for g in report.groups %}
+  <h2 class="grp">「{{ g.sheet }}」 → {% if g.parent_pk %}#{{ g.parent_pk }} {% endif %}{{ g.pname }}{% if g.pipn %} ({{ g.pipn }}){% endif %}
+    {% if g.auto == 'reused' %}<span class="tag reused">复用已有</span>{% elif g.auto == 'will_create' %}<span class="tag created">将新建</span>{% endif %}
+  </h2>
+  <p class="hint">新建 {{ g.sub.created }} · 复用 {{ g.sub.reused }} · BOM 行 {{ g.sub.bom_rows }} · 失败 {{ g.sub.failed }}</p>
   <table>
-    <tr><th>行</th><th>名称</th><th>动作</th><th>说明（[表名] 前缀标识所属工作表）</th></tr>
-    {% for l in report.lines %}
+    <tr><th>行</th><th>名称</th><th>动作</th><th>类别</th><th>说明</th></tr>
+    {% for l in g.sub.lines %}
     <tr class="{% if not l.ok %}bad{% endif %}">
       <td>{{ l.row }}</td>
       <td>{{ l.name }}</td>
-      <td><span class="tag {% if l.action == 'reused' %}reused{% elif l.action == 'error' %}error{% else %}created{% endif %}">{{ l.action }}</span></td>
+      <td><span class="tag {% if l.action == 'reused' %}reused{% elif l.action == 'error' %}error{% elif l.action == 'link' %}link{% else %}created{% endif %}">{{ l.action }}</span></td>
+      <td>{{ l.cat }}</td>
       <td>{{ l.note }}</td>
     </tr>
     {% endfor %}
   </table>
+  {% endfor %}
 
   {% if dry_run %}
   <form method="post" style="margin-top:20px;">
@@ -89,11 +95,13 @@
               <option value="new:{{ pk }}">新建到 {{ nm }}</option>
               {% endfor %}
             </optgroup>
-            <optgroup label="映射到已有类别">
-              {% for pk, nm in cats %}
+            {% for top, kids in cat_tree %}
+            <optgroup label="{{ top }}">
+              {% for pk, nm in kids %}
               <option value="map:{{ pk }}">{{ nm }}</option>
               {% endfor %}
             </optgroup>
+            {% endfor %}
           </select>
         </td>
       </tr>
