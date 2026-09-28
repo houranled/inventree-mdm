@@ -6,6 +6,7 @@
 
 import io
 import logging
+import re
 
 logger = logging.getLogger('inventree')
 
@@ -14,15 +15,29 @@ logger = logging.getLogger('inventree')
 # 文件解析
 # ------------------------------------------------------------------
 
-def parse_file(django_file):
-    """解析上传的 xlsx/xls/csv，返回 (headers, rows)。
+def sheet_name_of(name, raw):
+    """取 xlsx 的活动工作表名；其他格式返回 None。"""
+    if not name.endswith('.xlsx'):
+        return None
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True)
+        return wb.active.title
+    except Exception:
+        return None
 
-    headers: [列名...]
-    rows:    [{列名: 值, ...}, ...]
+
+def parse_file(django_file):
+    """解析上传的 xlsx/xls/csv，返回 (headers, rows, sheet_name)。
+
+    headers:     [列名...]
+    rows:        [{列名: 值, ...}, ...]
+    sheet_name:  xlsx 活动表名（用于自动命名父零件），其他格式为 None。
     优先用 InvenTree 自带的 tablib，失败退回 openpyxl。
     """
     raw = django_file.read()
     name = (getattr(django_file, 'name', '') or '').lower()
+    sheet = sheet_name_of(name, raw)
 
     # 1) tablib（InvenTree 依赖，支持 xlsx/xls/csv）
     try:
@@ -43,7 +58,7 @@ def parse_file(django_file):
         rows = []
         for row in data.dict:
             rows.append({str(k).strip(): row[k] for k in row})
-        return headers, rows
+        return headers, rows, sheet
     except Exception:
         logger.exception('WeiTiMDM.bom: tablib 解析失败，尝试 openpyxl')
 
@@ -59,7 +74,7 @@ def parse_file(django_file):
             continue
         rows.append({headers[i]: r[i] if i < len(r) else None
                      for i in range(len(headers))})
-    return headers, rows
+    return headers, rows, getattr(ws, 'title', None) or sheet
 
 
 def cell(row, col):
@@ -127,6 +142,58 @@ def find_existing_part(name, category, spec_text):
 # ------------------------------------------------------------------
 # 建零件 / 挂 BOM
 # ------------------------------------------------------------------
+
+def part_name_from_source(text):
+    """从工作表名/文件名取零件名：去扩展名，截掉 'BOM' 及之后内容。
+
+    '间隙传感器BOM清单'                 -> '间隙传感器'
+    '间隙采集整车BOM_20260922_含x(1)'    -> '间隙采集整车'
+    """
+    s = (text or '').strip()
+    s = re.sub(r'\.(xlsx|xls|csv)$', '', s, flags=re.I)
+    s = re.split(r'BOM', s, flags=re.I)[0]
+    return s.strip(' -_—–（）()')
+
+
+def finished_goods_category():
+    """定位「成品」小类：优先 702- 前缀，其次名称含「成品」的编码类别。"""
+    from part.models import PartCategory
+    from weiti_mdm import CATEGORY_CODE_RE
+    cats = [c for c in PartCategory.objects.all().only('name')
+            if '成品' in (c.name or '')]
+    for c in cats:
+        m = CATEGORY_CODE_RE.match(c.name or '')
+        if m and m.group(1) == '702':
+            return c
+    return cats[0] if cats else None
+
+
+def auto_parent_part(sheet_name):
+    """父零件留空时按表名定位/自动创建成品类装配体。
+
+    返回 (part_or_None, action)。action: reused/created/empty。
+    """
+    from part.models import Part
+    name = part_name_from_source(sheet_name)
+    if not name:
+        return None, 'empty'
+    existing = Part.objects.filter(name=name).first()
+    if existing:
+        if not existing.assembly:
+            existing.assembly = True      # 要挂 BOM 行，父件必须是装配体
+            existing.save(update_fields=['assembly'])
+        return existing, 'reused'
+    part = Part(
+        name=name,
+        description=name,
+        category=finished_goods_category(),
+        assembly=True, salable=True,
+        component=False, purchaseable=False)
+    # 保存触发插件信号 → 类别内参数模板决定正式码或 ! 待完善码
+    part.save()
+    part.refresh_from_db()
+    return part, 'created'
+
 
 def resolve_category(category_text):
     """用插件的归类逻辑把类别文本解析成类别对象（可能 None）。"""

@@ -832,14 +832,27 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
         # 步骤2：上传文件 → 解析 → 存 session → 渲染映射页
         if action == 'upload':
             f = request.FILES.get('file')
-            parent = self._resolve_parent(request.POST.get('parent'))
-            if not f or parent is None:
-                ctx['error'] = '请同时提供 BOM 文件和有效的父零件(ID/IPN/名称)'
+            if not f:
+                ctx['error'] = '请提供 BOM 文件'
                 return self._render(request, 'bom_upload.html', ctx)
             try:
-                headers, rows = bom_import.parse_file(f)
+                headers, rows, sheet = bom_import.parse_file(f)
             except Exception as e:
                 ctx['error'] = f'文件解析失败: {e}'
+                return self._render(request, 'bom_upload.html', ctx)
+            parent_key = (request.POST.get('parent') or '').strip()
+            auto_parent = None
+            if parent_key:
+                parent = self._resolve_parent(parent_key)
+            else:
+                # 父零件留空 → 按工作表名自动定位/创建成品类装配体
+                parent, auto_parent = bom_import.auto_parent_part(
+                    sheet or f.name)
+            if parent is None:
+                ctx['error'] = ('父零件无效：'
+                                + ('填写了 ID/IPN/名称但找不到对应零件'
+                                   if parent_key else
+                                   '无法从表名生成零件名，请手动指定父零件'))
                 return self._render(request, 'bom_upload.html', ctx)
             # session 存纯字符串,避免 JSON 序列化问题
             srows = [{k: ('' if v is None else str(v)) for k, v in r.items()}
@@ -851,7 +864,7 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
             guess = self._guess_columns(headers)
             ctx.update({'headers': headers, 'preview': preview,
                         'row_count': len(srows), 'parent': parent,
-                        'guess': guess,
+                        'auto_parent': auto_parent, 'guess': guess,
                         'spec_sel': [guess['spec']] if guess['spec'] else []})
             return self._render(request, 'bom_map.html', ctx)
 

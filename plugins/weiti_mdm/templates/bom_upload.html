@@ -31,8 +31,8 @@
       <input type="hidden" name="action" value="upload">
 
       <label>父零件（顶层产品 / 装配体）</label>
-      <input type="text" name="parent" placeholder="零件 ID、IPN 或 名称，如 101-...-0001 或 小云台" required>
-      <div class="hint">BOM 的所有行都会挂到这个父零件下。</div>
+      <input type="text" name="parent" placeholder="零件 ID、IPN 或 名称；留空按表名自动建成品">
+      <div class="hint">留空 → 用工作表名自动创建成品类父零件（去掉 "BOM" 及之后内容，如「间隙传感器BOM清单」→ 间隙传感器）。BOM 的所有行都会挂到这个父零件下。</div>
 
       <label>BOM 文件（.xlsx / .xls / .csv）</label>
       <input type="file" name="file" accept=".xlsx,.xls,.csv" required>
