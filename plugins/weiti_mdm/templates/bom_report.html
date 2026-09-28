@@ -30,7 +30,16 @@
 </head>
 <body>
   <h1>BOM 导入{% if dry_run %} — 预览（未落库）{% else %} — 已完成{% endif %}</h1>
+  {% if parent %}
   <p>父零件：<b>{{ parent.name }}</b>{% if parent.IPN %} ({{ parent.IPN }}){% endif %}</p>
+  {% elif sheets %}
+  <p>共 {{ sheets|length }} 个工作表：</p>
+  <ul>
+    {% for s in sheets %}
+    <li>「{{ s.sheet }}」 → #{{ s.parent_pk }} {{ s.pname }}{% if s.pipn %} ({{ s.pipn }}){% endif %}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
 
   {% if dry_run %}
     <div class="banner dry">这是预览，数据库<b>未改动</b>。核对无误后点下方「确认导入」。</div>
@@ -46,7 +55,7 @@
   </div>
 
   <table>
-    <tr><th>行</th><th>名称</th><th>动作</th><th>说明</th></tr>
+    <tr><th>行</th><th>名称</th><th>动作</th><th>说明（[表名] 前缀标识所属工作表）</th></tr>
     {% for l in report.lines %}
     <tr class="{% if not l.ok %}bad{% endif %}">
       <td>{{ l.row }}</td>
@@ -61,11 +70,7 @@
   <form method="post" style="margin-top:20px;">
     {% csrf_token %}
     <input type="hidden" name="action" value="commit">
-    <input type="hidden" name="col_name" value="{{ mapping.name }}">
-    <input type="hidden" name="col_qty" value="{{ mapping.qty }}">
-    <input type="hidden" name="col_ref" value="{{ mapping.ref }}">
-    <input type="hidden" name="col_category" value="{{ mapping.category }}">
-    {% for s in mapping.spec %}<input type="hidden" name="col_spec" value="{{ s }}">{% endfor %}
+    {% for name, val in mfields %}<input type="hidden" name="{{ name }}" value="{{ val }}">{% endfor %}
 
     {% if missing %}
     <h2 style="font-size:16px;margin-top:20px;">

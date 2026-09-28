@@ -795,6 +795,10 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
             path('bom-import.js', self.view_bom_js, name='bom-import-js'),
             path('bom-export/<int:pk>/', self.view_bom_export,
                  name='bom-export'),
+            path('bom-export-tree/<int:pk>/', self.view_bom_export_tree,
+                 name='bom-export-tree'),
+            path('bom-export-multi/', self.view_bom_export_multi,
+                 name='bom-export-multi'),
         ]
 
     # ---------- 零件详情页"BOM导入"按钮（primary_action UI 特性） ----------
@@ -834,6 +838,23 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                 'context': {'url': f'/plugin/weiti_mdm/bom-export/{pk}/'},
                 'source': '/plugin/weiti_mdm/bom-import.js',
             })
+            # 子件里有装配体 → 再加"导出BOM树"（多 tab 整树导出）
+            try:
+                from part.models import BomItem
+                has_sub_assembly = BomItem.objects.filter(
+                    part_id=pk, sub_part__assembly=True).exists()
+            except Exception:
+                has_sub_assembly = False
+            if has_sub_assembly:
+                actions.append({
+                    'key': 'weiti-bom-tree',
+                    'title': '导出BOM树',
+                    'icon': 'ti:sitemap:outline',
+                    'options': {'color': 'grape'},
+                    'context': {'url': '/plugin/weiti_mdm/'
+                                       f'bom-export-tree/{pk}/'},
+                    'source': '/plugin/weiti_mdm/bom-import.js',
+                })
         return actions
 
     def view_bom_js(self, request):
@@ -846,10 +867,22 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
               '}\n')
         return HttpResponse(js, content_type='application/javascript')
 
+    @staticmethod
+    def _xlsx_response(data, filename):
+        """xlsx 文件下载响应。"""
+        from urllib.parse import quote
+        from django.http import HttpResponse
+        resp = HttpResponse(
+            data,
+            content_type='application/vnd.openxmlformats-'
+                         'officedocument.spreadsheetml.sheet')
+        resp['Content-Disposition'] = (
+            f"attachment; filename*=UTF-8''{quote(filename)}")
+        return resp
+
     def view_bom_export(self, request, pk):
-        """导出零件 BOM 为带图片的 xlsx 文件。"""
-        from django.http import (
-            HttpResponse, HttpResponseForbidden, HttpResponseNotFound)
+        """导出单个零件 BOM 为带图片的 xlsx。"""
+        from django.http import HttpResponseForbidden, HttpResponseNotFound
         import bom_export
 
         if not request.user.is_authenticated:
@@ -858,17 +891,42 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
         part = Part.objects.filter(pk=pk).first()
         if not part:
             return HttpResponseNotFound('零件不存在')
+        return self._xlsx_response(
+            bom_export.build_bom_book([part]), f'{part.name}BOM.xlsx')
 
-        data = bom_export.build_bom_xlsx(part)
-        from urllib.parse import quote
-        fname = quote(f'{part.name}BOM.xlsx')
-        resp = HttpResponse(
-            data,
-            content_type='application/vnd.openxmlformats-'
-                         'officedocument.spreadsheetml.sheet')
-        resp['Content-Disposition'] = (
-            f"attachment; filename*=UTF-8''{fname}")
-        return resp
+    def view_bom_export_tree(self, request, pk):
+        """导出装配树：自身 + 所有下级装配体，每个零件一个工作表。"""
+        from django.http import HttpResponseForbidden, HttpResponseNotFound
+        import bom_export
+
+        if not request.user.is_authenticated:
+            return HttpResponseForbidden('需要登录')
+        from part.models import Part
+        part = Part.objects.filter(pk=pk).first()
+        if not part:
+            return HttpResponseNotFound('零件不存在')
+        parts = bom_export.collect_assemblies(part)
+        return self._xlsx_response(
+            bom_export.build_bom_book(parts), f'{part.name}BOM树.xlsx')
+
+    def view_bom_export_multi(self, request):
+        """任意多零件合并导出：GET ?pks=1,2,3 → 每个零件一个工作表。"""
+        from django.http import (
+            HttpResponseBadRequest, HttpResponseForbidden)
+        import bom_export
+
+        if not request.user.is_authenticated:
+            return HttpResponseForbidden('需要登录')
+        pks = [int(x) for x in request.GET.get('pks', '').split(',')
+               if x.strip().isdigit()]
+        if not pks:
+            return HttpResponseBadRequest('缺少 ?pks= 参数')
+        from part.models import Part
+        parts = list(Part.objects.filter(pk__in=pks))
+        if not parts:
+            return HttpResponseBadRequest('没有匹配到零件')
+        return self._xlsx_response(
+            bom_export.build_bom_book(parts), 'BOM合集.xlsx')
 
     def _resolve_parent(self, key):
         """按 pk / IPN / 名称 定位父零件。"""
@@ -908,86 +966,175 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                'prefill': request.GET.get('parent', '')}
         action = request.POST.get('action', '') if request.method == 'POST' else ''
 
-        # 步骤2：上传文件 → 解析 → 存 session → 渲染映射页
+        # 步骤2：上传文件 → 解析所有工作表 → 落工作目录 → 渲染映射页
         if action == 'upload':
+            import json
+            import shutil
+            import uuid
+            from django.conf import settings as dj_settings
+
             f = request.FILES.get('file')
             if not f:
                 ctx['error'] = '请提供 BOM 文件'
                 return self._render(request, 'bom_upload.html', ctx)
             try:
-                headers, rows, sheet, images = bom_import.parse_file(f)
+                sheets = bom_import.parse_all_sheets(f)
             except Exception as e:
                 ctx['error'] = f'文件解析失败: {e}'
                 return self._render(request, 'bom_upload.html', ctx)
-            # 图片字节不能进 session → 落临时目录，只存路径映射
-            if images:
-                import uuid
-                from django.conf import settings as dj_settings
-                img_dir = os.path.join(
-                    dj_settings.MEDIA_ROOT, 'tmp',
-                    f'bom_{uuid.uuid4().hex[:12]}')
-                request.session['bom_imgs'] = {
-                    str(k): v for k, v in
-                    bom_import.stash_images(images, img_dir).items()}
-                request.session['bom_imgdir'] = img_dir
-            parent_key = (request.POST.get('parent') or '').strip()
-            auto_parent = None
-            if parent_key:
-                parent = self._resolve_parent(parent_key)
-            else:
-                # 父零件留空 → 按工作表名自动定位/创建成品类装配体
-                parent, auto_parent = bom_import.auto_parent_part(
-                    sheet or f.name)
-            if parent is None:
-                ctx['error'] = ('父零件无效：'
-                                + ('填写了 ID/IPN/名称但找不到对应零件'
-                                   if parent_key else
-                                   '无法从表名生成零件名，请手动指定父零件'))
+            if not sheets:
+                ctx['error'] = '文件中没有可解析的工作表（需有表头和数据行）'
                 return self._render(request, 'bom_upload.html', ctx)
-            # session 存纯字符串,避免 JSON 序列化问题
-            srows = [{k: ('' if v is None else str(v)) for k, v in r.items()}
-                     for r in rows]
-            request.session['bom_headers'] = headers
-            request.session['bom_rows'] = srows
-            request.session['bom_parent'] = parent.pk
-            preview = [[r.get(h, '') for h in headers] for r in srows[:8]]
-            guess = self._guess_columns(headers)
-            ctx.update({'headers': headers, 'preview': preview,
-                        'row_count': len(srows), 'parent': parent,
-                        'auto_parent': auto_parent, 'guess': guess,
-                        'spec_sel': [guess['spec']] if guess['spec'] else []})
+
+            parent_key = (request.POST.get('parent') or '').strip()
+            fixed_parent = None
+            if parent_key:
+                fixed_parent = self._resolve_parent(parent_key)
+                if fixed_parent is None:
+                    ctx['error'] = ('父零件无效：填写了 ID/IPN/名称'
+                                    '但找不到对应零件')
+                    return self._render(request, 'bom_upload.html', ctx)
+                sheets = sheets[:1]   # 指定父零件 → 只导第一个工作表
+
+            # 工作目录：行数据(JSON) + 图片都落盘，session 只存元信息
+            work = os.path.join(dj_settings.MEDIA_ROOT, 'tmp',
+                                f'bom_{uuid.uuid4().hex[:12]}')
+            os.makedirs(work, exist_ok=True)
+            meta = []
+            sheets_view = []
+            for idx, s in enumerate(sheets):
+                if fixed_parent is not None:
+                    pp, pa = fixed_parent, None
+                else:
+                    # 父零件留空 → 按各表名自动定位/创建成品类装配体
+                    pp, pa = bom_import.auto_parent_part(s['sheet'])
+                if pp is None:
+                    shutil.rmtree(work, ignore_errors=True)
+                    ctx['error'] = (f'工作表「{s["sheet"]}」名称无法生成'
+                                    '零件名，请手动指定父零件')
+                    return self._render(request, 'bom_upload.html', ctx)
+                srows = [{k: ('' if v is None else str(v))
+                          for k, v in r.items()} for r in s['rows']]
+                with open(os.path.join(work, f'sheet_{idx}.json'),
+                          'w', encoding='utf-8') as fh:
+                    json.dump({'headers': s['headers'], 'rows': srows},
+                              fh, ensure_ascii=False)
+                meta.append({
+                    'sheet': s['sheet'], 'json': f'sheet_{idx}.json',
+                    'parent_pk': pp.pk, 'pname': pp.name,
+                    'pipn': pp.IPN or '', 'auto': pa,
+                    'rows': len(srows),
+                    'imgs': bom_import.stash_images(
+                        s['images'], work, prefix=f's{idx}_')})
+                g = self._guess_columns(s['headers'])
+                sheets_view.append({
+                    'idx': idx, 'sheet': s['sheet'], 'headers': s['headers'],
+                    'parent_pk': pp.pk, 'pname': pp.name,
+                    'pipn': pp.IPN or '', 'auto': pa, 'rows': len(srows),
+                    'preview': [[r.get(h, '') for h in s['headers']]
+                                for r in srows[:3]],
+                    'guess': g,
+                    'spec_sel': [g['spec']] if g['spec'] else []})
+            request.session['bom_work'] = work
+            request.session['bom_sheets'] = meta
+            ctx.update({'sheets_view': sheets_view,
+                        'row_count': sum(m['rows'] for m in meta),
+                        'parent': fixed_parent})
             return self._render(request, 'bom_map.html', ctx)
 
-        # 步骤3/4：预览(dry-run) 或 提交
+        # 步骤3/4：预览(dry-run) 或 提交（逐工作表执行）
         if action in ('preview', 'commit'):
-            parent = self._resolve_parent(
-                str(request.session.get('bom_parent', '')))
-            rows = request.session.get('bom_rows', [])
-            images = {int(k): v for k, v in
-                      request.session.get('bom_imgs', {}).items()}
-            if parent is None or not rows:
+            import json
+            import shutil
+
+            work = request.session.get('bom_work', '')
+            meta = request.session.get('bom_sheets', [])
+            if not work or not meta:
                 ctx['error'] = '会话已过期，请重新上传'
                 return self._render(request, 'bom_upload.html', ctx)
-            mapping = {k: request.POST.get('col_' + k, '')
-                       for k in ('name', 'qty', 'ref', 'category')}
-            # 规格列允许多选：存列表，run_import 里按序拼接
-            mapping['spec'] = [s for s in request.POST.getlist('col_spec') if s]
-            if not mapping['name']:
-                hdrs = request.session.get('bom_headers', [])
-                preview = [[r.get(h, '') for h in hdrs] for r in rows[:8]]
-                ctx.update({'headers': hdrs, 'preview': preview,
-                            'row_count': len(rows), 'parent': parent,
-                            'error': '必须指定「组件名称」列', 'guess': mapping,
-                            'spec_sel': mapping['spec']})
+            sheet_data = []
+            for m in meta:
+                with open(os.path.join(work, m['json']),
+                          encoding='utf-8') as fh:
+                    sd = json.load(fh)
+                sheet_data.append(
+                    (m, sd['headers'], sd['rows'],
+                     {int(k): v for k, v in (m.get('imgs') or {}).items()}))
+            all_rows = [r for _m, _h, rows, _i in sheet_data for r in rows]
+
+            # 每个工作表独立一套列映射：字段名带 _{idx} 后缀
+            mappings = []
+            for idx in range(len(sheet_data)):
+                mp = {k: request.POST.get(f'col_{k}_{idx}', '')
+                      for k in ('name', 'qty', 'ref', 'category')}
+                mp['spec'] = [s for s in
+                              request.POST.getlist(f'col_spec_{idx}') if s]
+                mappings.append(mp)
+            if any(not mp['name'] for mp in mappings):
+                # 重渲染映射页，保留用户已选的列
+                sheets_view = []
+                for idx, (m, hdrs, rows, _i) in enumerate(sheet_data):
+                    mp = mappings[idx]
+                    sheets_view.append({
+                        'idx': idx, 'sheet': m['sheet'], 'headers': hdrs,
+                        'parent_pk': m['parent_pk'], 'pname': m['pname'],
+                        'pipn': m['pipn'], 'auto': m['auto'],
+                        'rows': len(rows),
+                        'preview': [[r.get(h, '') for h in hdrs]
+                                    for r in rows[:3]],
+                        'guess': mp, 'spec_sel': mp['spec']})
+                ctx.update({'sheets_view': sheets_view,
+                            'row_count': len(all_rows),
+                            'error': '每个工作表都必须指定「组件名称」列'})
                 return self._render(request, 'bom_map.html', ctx)
+
+            def collect_missing():
+                """跨所有工作表收集缺失类别（按各自映射的类别列）。"""
+                miss = []
+                for (_m, _h, rows, _i), mp in zip(sheet_data, mappings):
+                    for c in bom_import.missing_categories(
+                            rows, mp['category']):
+                        if c not in miss:
+                            miss.append(c)
+                return miss
+
+            def run_all(dry):
+                """逐工作表跑 run_import，汇总报告。"""
+                rep = {'created': 0, 'reused': 0, 'bom_rows': 0,
+                       'failed': 0, 'lines': []}
+                for idx, (m, _h, rows, imgs) in enumerate(sheet_data):
+                    pp = self._resolve_parent(str(m['parent_pk']))
+                    if pp is None:
+                        rep['failed'] += 1
+                        rep['lines'].append({
+                            'row': '-', 'name': m['sheet'],
+                            'action': 'error', 'ok': False,
+                            'note': '父零件不存在'})
+                        continue
+                    sub = bom_import.run_import(
+                        pp, rows, mappings[idx], dry_run=dry, images=imgs,
+                        category_map=run_all.category_map)
+                    for k in ('created', 'reused', 'bom_rows', 'failed'):
+                        rep[k] += sub[k]
+                    for ln in sub['lines']:
+                        ln['note'] = f"[{m['sheet']}] {ln['note']}"
+                    rep['lines'].extend(sub['lines'])
+                return rep
+            run_all.category_map = {}
+
             if action == 'preview':
-                report = bom_import.run_import(parent, rows, mapping,
-                                               dry_run=True, images=images)
-                ctx.update({'report': report, 'parent': parent,
-                            'mapping': mapping, 'dry_run': True})
+                report = run_all(dry=True)
+                # 映射字段平铺成 hidden input，提交时原样带回
+                mfields = []
+                for idx, mp in enumerate(mappings):
+                    for k in ('name', 'qty', 'ref', 'category'):
+                        mfields.append((f'col_{k}_{idx}', mp[k]))
+                    for s in mp['spec']:
+                        mfields.append((f'col_spec_{idx}', s))
+                ctx.update({'report': report, 'sheets': meta,
+                            'mfields': mfields, 'dry_run': True})
                 # 缺失类别清单 → 报告页里给下拉让用户决策
-                missing = bom_import.missing_categories(
-                    rows, mapping['category'])
+                missing = collect_missing()
                 if missing:
                     from part.models import PartCategory
                     ctx['missing'] = missing
@@ -999,8 +1146,7 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                 return self._render(request, 'bom_report.html', ctx)
 
             # commit：先落实用户在预览页选的类别决策，再导 BOM
-            category_map = {}
-            missing = bom_import.missing_categories(rows, mapping['category'])
+            missing = collect_missing()
             if missing:
                 from part.models import PartCategory
                 for i, raw in enumerate(missing):
@@ -1011,25 +1157,21 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                                 pk=int(dec[4:])).first()
                             nc = PartCategory(name=raw, parent=p)
                             nc.save()  # 插件信号自动编号 + 号段校验
-                            category_map[raw] = nc.name
+                            run_all.category_map[raw] = nc.name
                         elif dec.startswith('map:'):
                             ec = PartCategory.objects.filter(
                                 pk=int(dec[4:])).first()
                             if ec:
-                                category_map[raw] = ec.name
+                                run_all.category_map[raw] = ec.name
                     except Exception:
                         logger.exception('WeiTiMDM.bom: 类别决策失败 %s', raw)
-            report = bom_import.run_import(
-                parent, rows, mapping, dry_run=False,
-                category_map=category_map, images=images)
-            # 提交后清理图片临时目录
-            img_dir = request.session.pop('bom_imgdir', '')
-            request.session.pop('bom_imgs', None)
-            if img_dir:
-                import shutil
-                shutil.rmtree(img_dir, ignore_errors=True)
-            ctx.update({'report': report, 'parent': parent,
-                        'mapping': mapping, 'dry_run': False})
+            report = run_all(dry=False)
+            # 提交后清理工作目录（JSON + 图片）
+            request.session.pop('bom_work', None)
+            request.session.pop('bom_sheets', None)
+            shutil.rmtree(work, ignore_errors=True)
+            ctx.update({'report': report, 'sheets': meta,
+                        'dry_run': False})
             return self._render(request, 'bom_report.html', ctx)
 
         # 步骤1：GET → 上传页

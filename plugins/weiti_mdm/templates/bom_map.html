@@ -8,6 +8,7 @@
     body { font-family: system-ui, "Microsoft YaHei", sans-serif; max-width: 960px;
            margin: 32px auto; padding: 0 16px; color: #222; }
     h1 { font-size: 20px; }
+    h2.sheet { font-size: 16px; margin: 0 0 10px; }
     .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-top: 16px; }
     label { display: block; margin: 12px 0 4px; font-weight: 600; }
     select { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; }
@@ -22,61 +23,68 @@
   </style>
 </head>
 <body>
+  {% if parent %}
   <h1>映射列 — 父零件：{{ parent.name }} {% if parent.IPN %}({{ parent.IPN }}){% endif %}</h1>
-  {% if auto_parent %}<p class="hint">父零件为按工作表名自动{% if auto_parent == 'created' %}新建{% else %}复用{% endif %}的成品。</p>{% endif %}
-  <p class="hint">共 {{ row_count }} 行数据。请指定每个字段对应的列（组件名称必填，其余可留空）。</p>
+  {% else %}
+  <h1>映射列 — 共 {{ sheets_view|length }} 个工作表</h1>
+  {% endif %}
+  <p class="hint">共 {{ row_count }} 行数据。每个工作表独立设置列映射（组件名称必填，其余可留空）。</p>
 
   {% if error %}<div class="err">{{ error }}</div>{% endif %}
 
-  <div class="card">
-    <form method="post">
-      {% csrf_token %}
-      <input type="hidden" name="action" value="preview">
+  <form method="post">
+    {% csrf_token %}
+    <input type="hidden" name="action" value="preview">
+    {% for s in sheets_view %}
+    <div class="card">
+      <h2 class="sheet">「{{ s.sheet }}」 → #{{ s.parent_pk }} {{ s.pname }}{% if s.pipn %} ({{ s.pipn }}){% endif %}
+        {% if s.auto == 'created' %}<b>[新建]</b>{% elif s.auto == 'reused' %}<b>[复用]</b>{% endif %}
+        — {{ s.rows }} 行</h2>
       <div class="grid">
         <div>
           <label>组件名称列 *</label>
-          <select name="col_name" required>
+          <select name="col_name_{{ s.idx }}" required>
             <option value="">— 请选择 —</option>
-            {% for h in headers %}<option value="{{ h }}" {% if guess.name == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
+            {% for h in s.headers %}<option value="{{ h }}" {% if s.guess.name == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
           </select>
         </div>
         <div>
           <label>数量列</label>
-          <select name="col_qty">
+          <select name="col_qty_{{ s.idx }}">
             <option value="">— 无（默认1）—</option>
-            {% for h in headers %}<option value="{{ h }}" {% if guess.qty == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
+            {% for h in s.headers %}<option value="{{ h }}" {% if s.guess.qty == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
           </select>
         </div>
         <div>
           <label>规格型号列（可多选，按列序拼接为描述）</label>
-          <select name="col_spec" multiple size="5" style="height:auto;">
-            {% for h in headers %}<option value="{{ h }}" {% if h in spec_sel %}selected{% endif %}>{{ h }}</option>{% endfor %}
+          <select name="col_spec_{{ s.idx }}" multiple size="5" style="height:auto;">
+            {% for h in s.headers %}<option value="{{ h }}" {% if h in s.spec_sel %}selected{% endif %}>{{ h }}</option>{% endfor %}
           </select>
           <p class="hint">按住 Ctrl 多选；多列内容按表格列顺序用「;」拼接</p>
         </div>
         <div>
           <label>类别列（用于新建零件归类）</label>
-          <select name="col_category">
+          <select name="col_category_{{ s.idx }}">
             <option value="">— 无 —</option>
-            {% for h in headers %}<option value="{{ h }}" {% if guess.category == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
+            {% for h in s.headers %}<option value="{{ h }}" {% if s.guess.category == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
           </select>
         </div>
         <div>
           <label>位号列（BOM reference）</label>
-          <select name="col_ref">
+          <select name="col_ref_{{ s.idx }}">
             <option value="">— 无 —</option>
-            {% for h in headers %}<option value="{{ h }}" {% if guess.ref == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
+            {% for h in s.headers %}<option value="{{ h }}" {% if s.guess.ref == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
           </select>
         </div>
       </div>
-      <button class="btn" type="submit">预览（不落库）</button>
-    </form>
-  </div>
-
-  <h3>数据预览（前 {{ preview|length }} 行）</h3>
-  <table>
-    <tr>{% for h in headers %}<th>{{ h }}</th>{% endfor %}</tr>
-    {% for r in preview %}<tr>{% for v in r %}<td>{{ v }}</td>{% endfor %}</tr>{% endfor %}
-  </table>
+      <h3 class="hint">数据预览（前 {{ s.preview|length }} 行）</h3>
+      <table>
+        <tr>{% for h in s.headers %}<th>{{ h }}</th>{% endfor %}</tr>
+        {% for r in s.preview %}<tr>{% for v in r %}<td>{{ v }}</td>{% endfor %}</tr>{% endfor %}
+      </table>
+    </div>
+    {% endfor %}
+    <button class="btn" type="submit">预览（不落库）</button>
+  </form>
 </body>
 </html>

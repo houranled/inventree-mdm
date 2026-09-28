@@ -36,17 +36,20 @@ def _fit_image(path):
         return None
 
 
-def build_bom_xlsx(part):
-    """导出零件 BOM 为 xlsx 字节流。无 BOM 行时也返回（仅表头）。"""
-    import openpyxl
-    from part.models import BomItem
+def _sheet_title(name, used):
+    """工作表名：≤31字符、去非法字符、重名加 _2/_3 后缀。"""
+    base = f'{name}BOM'[:28].translate(str.maketrans('', '', '[]:*?/\\')) or 'BOM'
+    title, n = base, 1
+    while title in used:
+        n += 1
+        title = f'{base}_{n}'[:31]
+    used.add(title)
+    return title
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    name = part.name or f'part{part.pk}'
-    # 工作表名 ≤31 字符且不含 []:*?/\\
-    title = f'{name}BOM清单'
-    ws.title = title[:31].translate(str.maketrans('', '', '[]:*?/\\'))
+
+def _fill_sheet(ws, part):
+    """把一个零件的 BOM 填进工作表（含图片）。"""
+    from part.models import BomItem
 
     ws.append(HEADERS)
     for i, w in enumerate(COL_WIDTHS):
@@ -80,6 +83,38 @@ def build_bom_xlsx(part):
             if img is not None:
                 ws.add_image(img, f'E{excel_row}')
 
+
+def collect_assemblies(part):
+    """递归收集装配体：自身 + 所有 BOM 子件中是装配体的（BFS，去重）。"""
+    from part.models import BomItem, Part
+    seen, queue, out = {part.pk}, [part], []
+    while queue:
+        cur = queue.pop(0)
+        out.append(cur)
+        subs = (BomItem.objects.filter(part=cur)
+                .values_list('sub_part_id', flat=True))
+        for sp in Part.objects.filter(pk__in=list(subs), assembly=True):
+            if sp.pk not in seen:
+                seen.add(sp.pk)
+                queue.append(sp)
+    return out
+
+
+def build_bom_book(parts):
+    """多个零件的 BOM 合并导出：每个零件一个工作表。"""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    used = set()
+    for part in parts:
+        ws = wb.create_sheet(
+            _sheet_title(part.name or f'part{part.pk}', used))
+        _fill_sheet(ws, part)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def build_bom_xlsx(part):
+    """单零件导出（兼容旧调用）。"""
+    return build_bom_book([part])

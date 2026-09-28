@@ -16,16 +16,34 @@ logger = logging.getLogger('inventree')
 # 文件解析
 # ------------------------------------------------------------------
 
-def sheet_name_of(name, raw):
-    """取 xlsx 的活动工作表名；其他格式返回 None。"""
-    if not name.endswith('.xlsx'):
-        return None
-    try:
-        import openpyxl
-        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True)
-        return wb.active.title
-    except Exception:
-        return None
+def _sheet_table(ws):
+    """读一个 worksheet → (headers, rows)。空行跳过。"""
+    it = ws.iter_rows(values_only=True)
+    headers = [str(c).strip() if c is not None else '' for c in next(it, [])]
+    rows = []
+    for r in it:
+        if all(c is None or str(c).strip() == '' for c in r):
+            continue
+        rows.append({headers[i]: r[i] if i < len(r) else None
+                     for i in range(len(headers))})
+    return headers, rows
+
+
+def _sheet_images(ws, zf):
+    """一个 worksheet 的全部图片：浮动锚点图 + WPS 单元格嵌入图。"""
+    out = {}
+    for img in getattr(ws, '_images', []):
+        try:
+            row = img.anchor._from.row
+            fmt = getattr(img, 'format', None) or 'png'
+            data = img._data()
+        except Exception:
+            continue
+        if row >= 1 and data:
+            out.setdefault(row, (f'row_{row}.{fmt}', data))
+    for k, v in _wps_cell_images(ws, zf).items():
+        out.setdefault(k, v)
+    return out
 
 
 def _wps_cell_images(ws, zf):
@@ -79,105 +97,63 @@ def _wps_cell_images(ws, zf):
     return out
 
 
-def extract_images(name, raw):
-    """从 xlsx 提取图片 -> {数据行号(1起): (文件名, 字节)}。
-
-    行号与 rows 的 1-based 序号一致（表头行不计）。
-    支持两种存法：常规浮动嵌入图(xl/media锚点) + WPS 单元格嵌入图(DISPIMG)。
-    """
-    if not name.endswith('.xlsx'):
-        return {}
-    try:
-        import zipfile
-        import openpyxl
-        wb = openpyxl.load_workbook(io.BytesIO(raw))
-        ws = wb.active
-        out = {}
-        # 1) 常规嵌入图片（锚点在行上）
-        for img in getattr(ws, '_images', []):
-            try:
-                row = img.anchor._from.row
-                fmt = getattr(img, 'format', None) or 'png'
-                data = img._data()
-            except Exception:
-                continue
-            if row >= 1 and data:
-                out.setdefault(row, (f'row_{row}.{fmt}', data))
-        # 2) WPS 单元格嵌入图（DISPIMG 公式）
-        try:
-            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                for k, v in _wps_cell_images(ws, zf).items():
-                    out.setdefault(k, v)
-        except Exception:
-            logger.exception('WeiTiMDM.bom: WPS嵌入图解析失败')
-        return out
-    except Exception:
-        logger.exception('WeiTiMDM.bom: 提取图片失败')
-        return {}
-
-
-def stash_images(images, dest_dir):
-    """把 {行号:(文件名,字节)} 落盘，返回 {行号:文件路径}。"""
+def stash_images(images, dest_dir, prefix=''):
+    """把 {行号:(文件名,字节)} 落盘，返回 {行号:文件路径}。
+    prefix 用于多表导入时区分不同工作表的图片。"""
     os.makedirs(dest_dir, exist_ok=True)
     paths = {}
     for row_i, (fname, data) in images.items():
-        fp = os.path.join(dest_dir, f'{row_i}_{fname}')
+        fp = os.path.join(dest_dir, f'{prefix}{row_i}_{fname}')
         with open(fp, 'wb') as fh:
             fh.write(data)
         paths[row_i] = fp
     return paths
 
 
-def parse_file(django_file):
-    """解析上传的 xlsx/xls/csv，返回 (headers, rows, sheet_name, images)。
+def parse_all_sheets(django_file):
+    """解析文件的全部工作表 → [{'sheet','headers','rows','images'},...]。
 
-    headers:     [列名...]
-    rows:        [{列名: 值, ...}, ...]
-    sheet_name:  xlsx 活动表名（用于自动命名父零件），其他格式为 None。
-    images:      {数据行号(1起): (文件名, 字节)}，无嵌入图片为空 dict。
-    优先用 InvenTree 自带的 tablib，失败退回 openpyxl。
+    - xlsx: openpyxl 逐表解析，图片逐表提取（浮动图 + WPS DISPIMG）
+    - xls:  tablib Databook 逐表解析（不支持图片）
+    - csv:  单表，表名取文件名
+    无表头或无数据行的工作表会被跳过。
     """
     raw = django_file.read()
     name = (getattr(django_file, 'name', '') or '').lower()
-    sheet = sheet_name_of(name, raw)
-    images = extract_images(name, raw)
 
-    # 1) tablib（InvenTree 依赖，支持 xlsx/xls/csv）
-    try:
-        import tablib
-        fmt = None
-        if name.endswith('.csv'):
-            fmt = 'csv'
-        elif name.endswith('.xls'):
-            fmt = 'xls'
-        else:
-            fmt = 'xlsx'
-        data = tablib.Dataset()
-        if fmt == 'csv':
-            data.load(raw.decode('utf-8-sig'), format='csv')
-        else:
-            data.load(raw, format=fmt)
-        headers = [str(h).strip() if h is not None else '' for h in data.headers]
-        rows = []
-        for row in data.dict:
-            rows.append({str(k).strip(): row[k] for k in row})
-        return headers, rows, sheet, images
-    except Exception:
-        logger.exception('WeiTiMDM.bom: tablib 解析失败，尝试 openpyxl')
+    if name.endswith('.xlsx'):
+        import zipfile
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(raw))
+        out = []
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            for ws in wb.worksheets:
+                headers, rows = _sheet_table(ws)
+                if not headers or not rows:
+                    continue
+                out.append({'sheet': ws.title, 'headers': headers,
+                            'rows': rows, 'images': _sheet_images(ws, zf)})
+        return out
 
-    # 2) openpyxl 兜底（仅 xlsx）
-    import openpyxl
-    wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
-    ws = wb.active
-    rows_iter = ws.iter_rows(values_only=True)
-    headers = [str(c).strip() if c is not None else '' for c in next(rows_iter)]
-    rows = []
-    for r in rows_iter:
-        if all(c is None or str(c).strip() == '' for c in r):
-            continue
-        rows.append({headers[i]: r[i] if i < len(r) else None
-                     for i in range(len(headers))})
-    return headers, rows, getattr(ws, 'title', None) or sheet, images
+    # xls / csv 走 tablib
+    import tablib
+    if name.endswith('.csv'):
+        ds = tablib.Dataset()
+        ds.load(raw.decode('utf-8-sig'), format='csv')
+        datasets = [ds]
+    else:
+        book = tablib.Databook()
+        book.load(raw, format='xls')
+        datasets = list(book.sheets())
+    out = []
+    for ds in datasets:
+        headers = [str(h).strip() if h is not None else ''
+                   for h in (ds.headers or [])]
+        rows = [{str(k).strip(): row[k] for k in row} for row in ds.dict]
+        if headers and rows:
+            out.append({'sheet': getattr(ds, 'title', None) or name,
+                        'headers': headers, 'rows': rows, 'images': {}})
+    return out
 
 
 def cell(row, col):
