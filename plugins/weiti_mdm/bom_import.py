@@ -6,6 +6,7 @@
 
 import io
 import logging
+import os
 import re
 
 logger = logging.getLogger('inventree')
@@ -27,17 +28,119 @@ def sheet_name_of(name, raw):
         return None
 
 
+def _wps_cell_images(ws, zf):
+    """WPS 单元格嵌入图：图片在 xl/cellimages.xml，单元格以
+    =DISPIMG("ID_xxx",1) 公式引用。返回 {数据行号(1起): (文件名, 字节)}。
+    """
+    import xml.etree.ElementTree as ET
+
+    if 'xl/cellimages.xml' not in zf.namelist():
+        return {}
+
+    # rels: rId -> xl/media/imageN.xxx
+    rels = {}
+    for r in ET.fromstring(zf.read('xl/_rels/cellimages.xml.rels')):
+        rid, tgt = r.get('Id'), (r.get('Target') or '')
+        if rid and tgt:
+            rels[rid] = tgt if tgt.startswith('xl/') else 'xl/' + tgt.lstrip('/')
+
+    # cellimages.xml: 每个 pic 的 cNvPr@name=DISPIMG id，blip@r:embed=rId
+    id2rid = {}
+    for pic in ET.fromstring(zf.read('xl/cellimages.xml')).iter():
+        if not pic.tag.endswith('}pic'):
+            continue
+        name = rid = None
+        for el in pic.iter():
+            tag = el.tag.rsplit('}', 1)[-1]
+            if tag == 'cNvPr':
+                name = el.get('name')
+            elif tag == 'blip':
+                rid = el.get(
+                    '{http://schemas.openxmlformats.org/officeDocument/'
+                    '2006/relationships}embed')
+        if name and rid:
+            id2rid[name] = rid
+
+    # 单元格公式 -> 行号（openpyxl cell.row 为1基，表头=1 → 数据行号 = row-1）
+    out = {}
+    for row in ws.iter_rows():
+        for c in row:
+            v = c.value
+            if not (isinstance(v, str) and 'DISPIMG' in v):
+                continue
+            m = re.search(r'DISPIMG\("([^"]+)"', v)
+            if not m:
+                continue
+            path = rels.get(id2rid.get(m.group(1), ''), '')
+            if path and path in zf.namelist():
+                fmt = path.rsplit('.', 1)[-1]
+                out.setdefault(c.row - 1, (f'row_{c.row - 1}.{fmt}',
+                                           zf.read(path)))
+    return out
+
+
+def extract_images(name, raw):
+    """从 xlsx 提取图片 -> {数据行号(1起): (文件名, 字节)}。
+
+    行号与 rows 的 1-based 序号一致（表头行不计）。
+    支持两种存法：常规浮动嵌入图(xl/media锚点) + WPS 单元格嵌入图(DISPIMG)。
+    """
+    if not name.endswith('.xlsx'):
+        return {}
+    try:
+        import zipfile
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(raw))
+        ws = wb.active
+        out = {}
+        # 1) 常规嵌入图片（锚点在行上）
+        for img in getattr(ws, '_images', []):
+            try:
+                row = img.anchor._from.row
+                fmt = getattr(img, 'format', None) or 'png'
+                data = img._data()
+            except Exception:
+                continue
+            if row >= 1 and data:
+                out.setdefault(row, (f'row_{row}.{fmt}', data))
+        # 2) WPS 单元格嵌入图（DISPIMG 公式）
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                for k, v in _wps_cell_images(ws, zf).items():
+                    out.setdefault(k, v)
+        except Exception:
+            logger.exception('WeiTiMDM.bom: WPS嵌入图解析失败')
+        return out
+    except Exception:
+        logger.exception('WeiTiMDM.bom: 提取图片失败')
+        return {}
+
+
+def stash_images(images, dest_dir):
+    """把 {行号:(文件名,字节)} 落盘，返回 {行号:文件路径}。"""
+    os.makedirs(dest_dir, exist_ok=True)
+    paths = {}
+    for row_i, (fname, data) in images.items():
+        fp = os.path.join(dest_dir, f'{row_i}_{fname}')
+        with open(fp, 'wb') as fh:
+            fh.write(data)
+        paths[row_i] = fp
+    return paths
+
+
 def parse_file(django_file):
-    """解析上传的 xlsx/xls/csv，返回 (headers, rows, sheet_name)。
+    """解析上传的 xlsx/xls/csv，返回 (headers, rows, sheet_name, images)。
 
     headers:     [列名...]
     rows:        [{列名: 值, ...}, ...]
     sheet_name:  xlsx 活动表名（用于自动命名父零件），其他格式为 None。
+    images:      {数据行号(1起): (文件名, 字节)}，无嵌入图片为空 dict。
     优先用 InvenTree 自带的 tablib，失败退回 openpyxl。
     """
     raw = django_file.read()
     name = (getattr(django_file, 'name', '') or '').lower()
     sheet = sheet_name_of(name, raw)
+    images = extract_images(name, raw)
 
     # 1) tablib（InvenTree 依赖，支持 xlsx/xls/csv）
     try:
@@ -58,7 +161,7 @@ def parse_file(django_file):
         rows = []
         for row in data.dict:
             rows.append({str(k).strip(): row[k] for k in row})
-        return headers, rows, sheet
+        return headers, rows, sheet, images
     except Exception:
         logger.exception('WeiTiMDM.bom: tablib 解析失败，尝试 openpyxl')
 
@@ -74,7 +177,7 @@ def parse_file(django_file):
             continue
         rows.append({headers[i]: r[i] if i < len(r) else None
                      for i in range(len(headers))})
-    return headers, rows, getattr(ws, 'title', None) or sheet
+    return headers, rows, getattr(ws, 'title', None) or sheet, images
 
 
 def cell(row, col):
@@ -218,16 +321,36 @@ def missing_categories(rows, col_cat):
     return out
 
 
-def get_or_create_part(name, spec_text, category_text, dry_run):
+def attach_image(part, image_path, dry_run):
+    """把图片写进 part.image；零件已有图则跳过。返回附注字符串或 ''。"""
+    if not part or not image_path or not os.path.isfile(image_path):
+        return ''
+    if part.image:
+        return '已有图片跳过'
+    if dry_run:
+        return '将附图片'
+    from django.core.files.base import ContentFile
+    with open(image_path, 'rb') as fh:
+        part.image.save(os.path.basename(image_path), ContentFile(fh.read()))
+    return '已附图片'
+
+
+def get_or_create_part(name, spec_text, category_text, dry_run,
+                       image_path=None):
     """返回 (part_or_None, action, note)。action: reused/created/would_create。"""
     category = resolve_category(category_text)
     existing = find_existing_part(name, category, spec_text)
     if existing:
-        return existing, 'reused', f'复用 #{existing.pk} {existing.IPN or ""}'.strip()
+        note = f'复用 #{existing.pk} {existing.IPN or ""}'.strip()
+        img_note = attach_image(existing, image_path, dry_run)
+        return existing, 'reused', note + (f'；{img_note}' if img_note else '')
 
     if dry_run:
         cat_name = category.name if category else '(未匹配类别)'
-        return None, 'would_create', f'将新建 [{cat_name}] {name}'
+        note = f'将新建 [{cat_name}] {name}'
+        if image_path and os.path.isfile(image_path):
+            note += '（含图片）'
+        return None, 'would_create', note
 
     from part.models import Part
     part = Part(
@@ -243,7 +366,9 @@ def get_or_create_part(name, spec_text, category_text, dry_run):
     # 这里无需再手工补 !。
     part.save()
     part.refresh_from_db()
-    return part, 'created', f'新建 #{part.pk} {part.IPN or ""}'.strip()
+    note = f'新建 #{part.pk} {part.IPN or ""}'.strip()
+    img_note = attach_image(part, image_path, dry_run)
+    return part, 'created', note + (f'；{img_note}' if img_note else '')
 
 
 def add_bom_item(parent, sub_part, quantity, reference, note, dry_run):
@@ -274,11 +399,13 @@ def add_bom_item(parent, sub_part, quantity, reference, note, dry_run):
 # 主流程
 # ------------------------------------------------------------------
 
-def run_import(parent_part, rows, mapping, dry_run=True, category_map=None):
+def run_import(parent_part, rows, mapping, dry_run=True, category_map=None,
+               images=None):
     """执行 BOM 导入。
 
     mapping: {'name':列名, 'qty':列名, 'ref':列名, 'category':列名, 'spec':列名}
     category_map: {Excel原类别文本: 目标类别名}，用户在预览页确认的类别决策
+    images: {数据行号(1起): 图片文件路径}，随零件写入 part.image
     返回汇总 dict。
     """
     from django.db import transaction
@@ -308,9 +435,10 @@ def run_import(parent_part, rows, mapping, dry_run=True, category_map=None):
             qty = cell(row, col_qty) or '1'
             ref = cell(row, col_ref)
 
+            img_path = (images or {}).get(i)
             try:
                 part, action, note = get_or_create_part(
-                    name, spec, cat, dry_run)
+                    name, spec, cat, dry_run, image_path=img_path)
                 if action in ('created', 'would_create'):
                     report['created'] += 1
                 elif action == 'reused':

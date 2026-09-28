@@ -36,7 +36,8 @@ from django.core.exceptions import ValidationError
 from django.db.models.signals import post_save, pre_save
 
 from plugin import InvenTreePlugin
-from plugin.mixins import UrlsMixin, ValidationMixin
+from plugin.mixins import (
+    UrlsMixin, UserInterfaceMixin, ValidationMixin)
 
 logger = logging.getLogger('inventree')
 
@@ -762,7 +763,8 @@ def on_parameter_save(sender, instance, **kwargs):
 # 插件主体
 # ------------------------------------------------------------------
 
-class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
+class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
+                     ValidationMixin, InvenTreePlugin):
     """微体物料主数据插件：类别/选项自动编号 + IPN 自动生成 + BOM 一键导入。"""
 
     NAME = 'WeiTiMDM'
@@ -790,7 +792,40 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
         from django.urls import path
         return [
             path('bom-import/', self.view_bom_import, name='bom-import'),
+            path('bom-import.js', self.view_bom_js, name='bom-import-js'),
         ]
+
+    # ---------- 零件详情页"BOM导入"按钮（primary_action UI 特性） ----------
+
+    def get_ui_primary_actions(self, request, context, **kwargs):
+        """在零件详情页标题栏注入"BOM导入"按钮。
+
+        前端 PageDetail 用 query param 'location' 传当前路由路径，
+        零件详情页形如 /web/part/42/ —— 从中抠出 pk。
+        context 是 QueryDict，取不到/不匹配就返回空（不出按钮）。
+        """
+        m = re.search(r'/part/(\d+)', str(context.get('location', '')))
+        if not m:
+            return []
+        pk = m.group(1)
+        return [{
+            'key': 'weiti-bom-import',
+            'title': 'BOM导入',
+            'icon': 'ti:list-plus:outline',
+            'options': {'color': 'teal'},
+            'context': {'url': f'/plugin/weiti_mdm/bom-import/?parent={pk}'},
+            'source': '/plugin/weiti_mdm/bom-import.js',
+        }]
+
+    def view_bom_js(self, request):
+        """BOM导入按钮的点击处理 JS（整页跳转，非 SPA navigate）。"""
+        from django.http import HttpResponse
+        js = ('export function getFeature(args) {\n'
+              '  if (args && args.serverContext && args.serverContext.url) {\n'
+              '    window.location.href = args.serverContext.url;\n'
+              '  }\n'
+              '}\n')
+        return HttpResponse(js, content_type='application/javascript')
 
     def _resolve_parent(self, key):
         """按 pk / IPN / 名称 定位父零件。"""
@@ -826,7 +861,8 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
         if not (request.user.is_authenticated and request.user.is_staff):
             return HttpResponseForbidden('需要以员工(staff)身份登录')
 
-        ctx = {'plugin': self}
+        ctx = {'plugin': self,
+               'prefill': request.GET.get('parent', '')}
         action = request.POST.get('action', '') if request.method == 'POST' else ''
 
         # 步骤2：上传文件 → 解析 → 存 session → 渲染映射页
@@ -836,10 +872,21 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
                 ctx['error'] = '请提供 BOM 文件'
                 return self._render(request, 'bom_upload.html', ctx)
             try:
-                headers, rows, sheet = bom_import.parse_file(f)
+                headers, rows, sheet, images = bom_import.parse_file(f)
             except Exception as e:
                 ctx['error'] = f'文件解析失败: {e}'
                 return self._render(request, 'bom_upload.html', ctx)
+            # 图片字节不能进 session → 落临时目录，只存路径映射
+            if images:
+                import uuid
+                from django.conf import settings as dj_settings
+                img_dir = os.path.join(
+                    dj_settings.MEDIA_ROOT, 'tmp',
+                    f'bom_{uuid.uuid4().hex[:12]}')
+                request.session['bom_imgs'] = {
+                    str(k): v for k, v in
+                    bom_import.stash_images(images, img_dir).items()}
+                request.session['bom_imgdir'] = img_dir
             parent_key = (request.POST.get('parent') or '').strip()
             auto_parent = None
             if parent_key:
@@ -873,6 +920,8 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
             parent = self._resolve_parent(
                 str(request.session.get('bom_parent', '')))
             rows = request.session.get('bom_rows', [])
+            images = {int(k): v for k, v in
+                      request.session.get('bom_imgs', {}).items()}
             if parent is None or not rows:
                 ctx['error'] = '会话已过期，请重新上传'
                 return self._render(request, 'bom_upload.html', ctx)
@@ -890,7 +939,7 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
                 return self._render(request, 'bom_map.html', ctx)
             if action == 'preview':
                 report = bom_import.run_import(parent, rows, mapping,
-                                               dry_run=True)
+                                               dry_run=True, images=images)
                 ctx.update({'report': report, 'parent': parent,
                             'mapping': mapping, 'dry_run': True})
                 # 缺失类别清单 → 报告页里给下拉让用户决策
@@ -929,7 +978,13 @@ class WeiTiMDMPlugin(UrlsMixin, ValidationMixin, InvenTreePlugin):
                         logger.exception('WeiTiMDM.bom: 类别决策失败 %s', raw)
             report = bom_import.run_import(
                 parent, rows, mapping, dry_run=False,
-                category_map=category_map)
+                category_map=category_map, images=images)
+            # 提交后清理图片临时目录
+            img_dir = request.session.pop('bom_imgdir', '')
+            request.session.pop('bom_imgs', None)
+            if img_dir:
+                import shutil
+                shutil.rmtree(img_dir, ignore_errors=True)
             ctx.update({'report': report, 'parent': parent,
                         'mapping': mapping, 'dry_run': False})
             return self._render(request, 'bom_report.html', ctx)
