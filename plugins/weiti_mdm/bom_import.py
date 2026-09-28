@@ -87,7 +87,7 @@ def compute_feature_from_text(category, spec_text):
         val = match_value(tpl, spec_text or '')
         if not val:
             return None
-        segs.append(param_code(val))
+        segs.append(param_code(val, tpl))
     return ''.join(segs)
 
 
@@ -171,15 +171,11 @@ def get_or_create_part(name, spec_text, category_text, dry_run):
         component=True,
         purchaseable=True,
     )
-    # 保存触发插件信号 → 归类 + IPN + 描述反解参数
+    # 保存触发插件信号 → 归类 + IPN + 描述反解参数。
+    # 规格反解不全时，assign_ipn 会自动生成 !{code}-{槽位段} 的待完善码，
+    # 这里无需再手工补 !。
     part.save()
     part.refresh_from_db()
-    # 导入建件且规格反解不全（IPN 槽位码含 x 占位）→ 加 ! 前缀待人工复核
-    ipn = part.IPN or ''
-    if 'x' in ipn and not ipn.startswith('!'):
-        part.IPN = '!' + ipn
-        part.save(update_fields=['IPN'])
-        part.refresh_from_db()
     return part, 'created', f'新建 #{part.pk} {part.IPN or ""}'.strip()
 
 

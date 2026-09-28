@@ -13,8 +13,9 @@
      - 参数值 "03-金属膜电阻" → 取 "03"
      - 参数值 "10K"/"4.7K" 等阻值 → 按 有效数字+10的幂 编码(10K→103, 4.7K→472)
      - 无数字前缀且非阻值 → 兜底 "00"
-     - 参数没填全 → 发 201-03xx103xx 式槽位码（x=待补槽位），
-       补齐后自动升级正式码；导入建件且规格反解不全时加 ! 前缀待复核
+     - 参数没填全 → 发 !201-03??103? 式槽位码（?按字段位宽填=待补槽位）；
+       无论自动还是手工创建，只要含未设置的参数就以 ! 开头（待完善/复核），
+       参数补齐后自动升级为正式码、! 消失
      - 类别没绑参数模板 → 发 201-S0001 式无规格流水码（S=Spec-less，
        正式码不是临时态，无"待补"概念）
   4. 导入兼容: Excel 旧类别名经 keywords 字段自动归类(alias.txt 别名表 +
@@ -62,9 +63,9 @@ TOP_CODE_RE = re.compile(r'^(\d)[-\s_]+')
 OPT_CODE_RE = re.compile(r'^(\d+)')
 # IPN 成品格式: {小类码}-{规格段}，规格段=参数码按序拼接(无流水号)，
 # 如 102-030110301；无规格件: 805-S0001(S=Spec-less 流水码)；
-# 临时码(参数不全): !102-03xx103xx
-IPN_RE = re.compile(r'^\d{3}-[0-9A-Za-z]{2,}$')
-IPN_PROV_RE = re.compile(r'^!\d{3}-[0-9A-Za-z]+$')
+# 槽位码(参数不全): 一律带 ! 前缀，如 !102-03??103?（?按字段位宽）
+IPN_RE = re.compile(r'^\d{3}-[0-9A-Za-z?]{2,}$')
+IPN_PROV_RE = re.compile(r'^!\d{3}-[0-9A-Za-z?]+$')
 
 SERIAL_LEN = 4
 FALLBACK_CODE = '00'  # 参数值无数字前缀时的兜底段
@@ -291,8 +292,9 @@ def fix_import_fields(part):
 # ------------------------------------------------------------------
 
 def encode_resistance(text):
-    """阻值编码: D1D2=两位有效数字, D3=10的幂。
-    10K -> 103, 4.7K -> 472, 100Ω -> 101, 1M -> 105
+    """阻值编码: D1D2=两位有效数字, D3=10的幂，恒定 3 位。
+    10K -> 103, 4.7K -> 472, 100Ω -> 101, 1M -> 105, 180V -> 181
+    无法解析或超范围返回 None（交给上层兜底/占位）。
     """
     m = re.match(r'([\d.]+)\s*([kKmM]?)(?:\s*(?:Ω|ohm|R|欧))?', str(text).strip())
     if not m:
@@ -311,19 +313,47 @@ def encode_resistance(text):
     while ohms < 10:
         ohms *= 10
         exp -= 1
+    sig = int(round(ohms))          # 归一化后有效数字应落在 [10, 99]
+    if sig >= 100:                  # 边界: 如 99.6 四舍五入到 100
+        sig //= 10
+        exp += 1
     if exp < 0 or exp > 9:
         return None  # 超出单位数幂范围，交给兜底
-    return f'{int(round(ohms))}{exp}'
+    return f'{sig:02d}{exp}'        # 两位有效数字 + 一位幂 = 恒 3 位
 
 
-def param_code(value):
-    """参数值 -> 编码段：优先取前缀数字，其次按阻值规则，最后兜底。"""
+def param_code(value, template=None):
+    """参数值 -> 编码段。
+
+    传入 template 时按字段类型精确编码，并对齐到该字段位宽:
+      - 有选项  : 取所选项前缀数字码，左补零到位宽（"3-金属膜"→"03"）
+      - 数值型  : 走 encode_resistance，恒 3 位；无法解析 -> '?'*位宽
+      - 其它    : 取开头连续数字（流水号/型号/版本原样），左补零到位宽
+    不传 template 时（BOM 文本匹配等）用启发式:
+      "NN-文字" 视为选项码取前缀；带单位的阻值(10K)走 encode_resistance。
+    """
     s = str(value).strip()
-    m = OPT_CODE_RE.match(s)
+
+    if template is not None:
+        w = _slot_width(template)
+        if _template_choices(template):
+            m = re.match(r'^(\d+)', s)
+            return m.group(1).zfill(w) if m else '?' * w
+        if _is_numeric_template(template):
+            r = encode_resistance(s)
+            return r if r else '?' * w
+        m = re.match(r'^(\d+)', s)
+        return m.group(1).zfill(w) if m else '?' * w
+
+    # 无 template：启发式（选项码带横杠，阻值带单位/无横杠）
+    m = re.match(r'^(\d+)\s*-', s)
     if m:
         return m.group(1)
     r = encode_resistance(s)
-    return r if r else FALLBACK_CODE
+    if r:
+        return r
+    m = OPT_CODE_RE.match(s)
+    return m.group(1) if m else FALLBACK_CODE
 
 
 def get_category_code(part):
@@ -364,11 +394,18 @@ def _part_params(part):
     return params
 
 
+def _is_numeric_template(template):
+    """模板是否为"数值型"（阻值/容值/感值/压值），需走 encode_resistance 编码。"""
+    name = (getattr(template, 'name', '') or '').lower()
+    return any(k in name for k in ('阻值', '电阻值', 'resistance', '欧姆',
+                                   '容值', '感值', '压值'))
+
+
 def _slot_width(template):
-    """单个参数模板在规格段中占的位宽。
+    """单个参数模板在规格段中占的位宽（未填时占位符按此宽度出 ?）。
 
     - 有选项: 选项码的最大位数（"0-±1%"→1位, "03-金属膜"→2位）
-    - 无选项且像数值型（阻值/容值/感值）: 3位（D1D2有效数字+D3幂）
+    - 无选项且像数值型（阻值/容值/感值/压值）: 3位（D1D2有效数字+D3幂）
     - 其他: 2位兜底
     """
     widths = []
@@ -377,18 +414,17 @@ def _slot_width(template):
         widths.append(len(m.group(1)) if m else len(FALLBACK_CODE))
     if widths:
         return max(widths)
-    name = (getattr(template, 'name', '') or '').lower()
-    if any(k in name for k in ('阻值', '电阻值', 'resistance', '欧姆',
-                               '容值', '感值', '压值')):
+    if _is_numeric_template(template):
         return 3
     return len(FALLBACK_CODE)
 
 
 def feature_slots(part):
-    """规格槽位串：按类别绑定顺序，已填参数出码、未填槽位用 x 占位。
+    """规格槽位串：按类别绑定顺序，已填参数出码、未填槽位按位宽用 ? 占位。
 
     返回 None = 类别无模板绑定且零件无参数（无法构造槽位）。
-    含 x = 规格未录全（临时码用）；不含 x = 规格完整（正式特征段）。
+    含 ? = 规格未录全（临时码用）；不含 ? = 规格完整（正式特征段）。
+    空槽位占位宽度 = 该参数的字段位宽（阻值 3 位→???，精度 1 位→?）。
     """
     cat = getattr(part, 'category', None)
     if not cat:
@@ -408,16 +444,16 @@ def feature_slots(part):
     for tpl in tpls:
         val = params.get(tpl.name)
         if val is None or str(val).strip() == '':
-            segs.append('x' * _slot_width(tpl))
+            segs.append('?' * _slot_width(tpl))
         else:
-            segs.append(param_code(val))
+            segs.append(param_code(val, tpl))
     return ''.join(segs)
 
 
 def feature_segment(part):
     """完整规格段（参数全齐才有）：供正式码和 BOM 去重使用。"""
     seg = feature_slots(part)
-    if not seg or 'x' in seg:
+    if not seg or '?' in seg:
         return None
     return seg
 
@@ -438,8 +474,8 @@ def assign_ipn(part):
     """给零件生成/修正 IPN。返回 True 表示 IPN 被改写。
 
     - 参数填全 → 正式码 {code}-{feat}（无流水号：同规格同码，天然去重）
-    - 参数部分填 → 槽位码 {code}-{槽位段}，未填槽位用 x 占位
-    - 导入建件且规格反解不全 → 槽位码加 ! 前缀（待人工复核标记）
+    - 参数未填全 → 槽位码 !{code}-{槽位段}，未填槽位用 ? 占位；
+      无论自动还是手工创建，只要含未设置的参数就以 ! 开头（待完善/复核）
     - 类别未绑参数模板 → 无规格流水码 {code}-S{serial}（正式码，非临时态）
     - 参数补齐后自动升级为正式码（! 同时消失）
     """
@@ -459,16 +495,15 @@ def assign_ipn(part):
 
     slots = feature_slots(part)
     if slots:
-        # ! 只保留「导入建件且规格反解不全」的待复核标记：
-        # bom_import 建件时会先打好 !，这里靠 cur 保持粘性；
-        # 手工建件参数未填 → 槽位码但不带 !（x 槽位本身已标出缺口）
-        bang = '!' if cur.startswith('!') else ''
-        target = f'{bang}{code}-{slots}'
+        # 走到这里说明 slots 含 ? 槽位（有未设置的参数）——
+        # 无论自动还是手工创建，一律加 ! 前缀标记"待完善/复核"，
+        # 参数补齐后 feature_segment 生效走上面分支，! 自动消失。
+        target = f'!{code}-{slots}'
         if cur == target:
             return False
         part.IPN = target
-        logger.info('WeiTiMDM: %s -> %s (%s)', part.name, part.IPN,
-                    '待复核：导入参数反解不全' if bang else '参数未填全')
+        logger.info('WeiTiMDM: %s -> %s (参数未填全，待完善)',
+                    part.name, part.IPN)
         return True
 
     # 类别未绑定参数模板 → 无规格零件，直接发正式流水码
@@ -506,16 +541,36 @@ _processing = set()
 
 
 def category_templates(cat):
-    """返回类别关联的参数模板对象列表(按 pk 顺序)。"""
+    """返回类别关联的参数模板对象列表。
+
+    沿类别树向上收集：祖先类别绑定的模板也算数（与 InvenTree 的
+    "子类别继承父类别参数模板" 一致），因此模板只需绑在某一级父类别，
+    其下各级子类别的零件都能用到。
+    顺序：父类别在前、子类别在后（越靠上的字段排越前）；
+    同一类别内按 pk 排序；同一模板重复绑定只取最靠上的一次。
+    """
     from part.models import PartCategoryParameterTemplate
+    # 类别链：顶层祖先 -> ... -> 自身
+    chain = []
+    c = cat
+    seen_cat = set()
+    while c is not None and getattr(c, 'pk', None) not in seen_cat:
+        seen_cat.add(getattr(c, 'pk', None))
+        chain.append(c)
+        c = getattr(c, 'parent', None)
+    chain.reverse()
+
     out = []
+    seen_tpl = set()
     try:
-        for t in (PartCategoryParameterTemplate.objects
-                  .filter(category=cat).order_by('pk')):
-            tpl = getattr(t, 'template', None) or getattr(
-                t, 'parameter_template', None)
-            if tpl is not None:
-                out.append(tpl)
+        for cur in chain:
+            for t in (PartCategoryParameterTemplate.objects
+                      .filter(category=cur).order_by('pk')):
+                tpl = getattr(t, 'template', None) or getattr(
+                    t, 'parameter_template', None)
+                if tpl is not None and tpl.pk not in seen_tpl:
+                    seen_tpl.add(tpl.pk)
+                    out.append(tpl)
     except Exception:
         pass
     return out
