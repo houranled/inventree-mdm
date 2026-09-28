@@ -793,6 +793,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
         return [
             path('bom-import/', self.view_bom_import, name='bom-import'),
             path('bom-import.js', self.view_bom_js, name='bom-import-js'),
+            path('bom-export/<int:pk>/', self.view_bom_export,
+                 name='bom-export'),
         ]
 
     # ---------- 零件详情页"BOM导入"按钮（primary_action UI 特性） ----------
@@ -808,7 +810,7 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
         if not m:
             return []
         pk = m.group(1)
-        return [{
+        actions = [{
             'key': 'weiti-bom-import',
             'title': 'BOM导入',
             'icon': 'ti:list-plus:outline',
@@ -816,9 +818,26 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
             'context': {'url': f'/plugin/weiti_mdm/bom-import/?parent={pk}'},
             'source': '/plugin/weiti_mdm/bom-import.js',
         }]
+        # 有 BOM 行的零件才出"导出BOM"按钮
+        try:
+            from part.models import Part
+            has_bom = Part.objects.filter(
+                pk=pk, bom_items__isnull=False).exists()
+        except Exception:
+            has_bom = True
+        if has_bom:
+            actions.append({
+                'key': 'weiti-bom-export',
+                'title': '导出BOM',
+                'icon': 'ti:file-export:outline',
+                'options': {'color': 'orange'},
+                'context': {'url': f'/plugin/weiti_mdm/bom-export/{pk}/'},
+                'source': '/plugin/weiti_mdm/bom-import.js',
+            })
+        return actions
 
     def view_bom_js(self, request):
-        """BOM导入按钮的点击处理 JS（整页跳转，非 SPA navigate）。"""
+        """BOM导入/导出按钮的点击处理 JS（整页跳转，非 SPA navigate）。"""
         from django.http import HttpResponse
         js = ('export function getFeature(args) {\n'
               '  if (args && args.serverContext && args.serverContext.url) {\n'
@@ -826,6 +845,30 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
               '  }\n'
               '}\n')
         return HttpResponse(js, content_type='application/javascript')
+
+    def view_bom_export(self, request, pk):
+        """导出零件 BOM 为带图片的 xlsx 文件。"""
+        from django.http import (
+            HttpResponse, HttpResponseForbidden, HttpResponseNotFound)
+        import bom_export
+
+        if not request.user.is_authenticated:
+            return HttpResponseForbidden('需要登录')
+        from part.models import Part
+        part = Part.objects.filter(pk=pk).first()
+        if not part:
+            return HttpResponseNotFound('零件不存在')
+
+        data = bom_export.build_bom_xlsx(part)
+        from urllib.parse import quote
+        fname = quote(f'{part.name}BOM.xlsx')
+        resp = HttpResponse(
+            data,
+            content_type='application/vnd.openxmlformats-'
+                         'officedocument.spreadsheetml.sheet')
+        resp['Content-Disposition'] = (
+            f"attachment; filename*=UTF-8''{fname}")
+        return resp
 
     def _resolve_parent(self, key):
         """按 pk / IPN / 名称 定位父零件。"""
