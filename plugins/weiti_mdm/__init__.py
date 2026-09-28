@@ -857,6 +857,19 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                 })
         return actions
 
+    # ---------- 左侧导航注入（navigation UI 特性） ----------
+
+    def get_ui_navigation_items(self, request, context, **kwargs):
+        """在 PUI 原生导航里加一个「BOM导入」入口，点击整页跳插件页。"""
+        if not (request.user and request.user.is_staff):
+            return []
+        return [{
+            'key': 'weiti-bom-import-nav',
+            'title': 'BOM导入',
+            'icon': 'ti:list-plus:outline',
+            'options': {'url': '/plugin/weiti_mdm/bom-import/'},
+        }]
+
     def view_bom_js(self, request):
         """BOM导入/导出按钮的点击处理 JS（整页跳转，非 SPA navigate）。"""
         from django.http import HttpResponse
@@ -1122,6 +1135,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                 _Rollback 回滚；commit 时正常落库。
                 指定了顶层父零件时，每个表名生成的子装配件再挂一行
                 BOM 到该父零件。
+                每个工作表一个事务：建父件 + 行导入 + link 挂载
+                要么全成要么整表回滚，不留半提交状态。
                 """
                 from django.db import transaction
                 rep = {'created': 0, 'reused': 0, 'bom_rows': 0,
@@ -1168,16 +1183,25 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                     return sub
 
                 for idx, (m, _h, rows, imgs) in enumerate(sheet_data):
-                    if dry:
-                        try:
-                            with transaction.atomic():
-                                sub = run_sheet(m, rows, imgs,
-                                                mappings[idx])
+                    try:
+                        with transaction.atomic():
+                            sub = run_sheet(m, rows, imgs,
+                                            mappings[idx])
+                            if dry:
                                 raise bom_import._Rollback()
-                        except bom_import._Rollback:
-                            pass
-                    else:
-                        sub = run_sheet(m, rows, imgs, mappings[idx])
+                    except bom_import._Rollback:
+                        pass
+                    except Exception as e:
+                        # 整表回滚（含自动父零件），不中断后续工作表
+                        logger.exception(
+                            'WeiTiMDM.bom: 工作表「%s」导入失败', m['sheet'])
+                        sub = {'created': 0, 'reused': 0, 'bom_rows': 0,
+                               'failed': max(1, len(rows)),
+                               'lines': [{'row': '—', 'name': m['sheet'],
+                                          'action': 'error', 'cat': '',
+                                          'note': (f'导入失败，本表已整体'
+                                                   f'回滚：{e}'),
+                                          'ok': False}]}
                     if sub is None:
                         sub = {'created': 0, 'reused': 0, 'bom_rows': 0,
                                'failed': 1,

@@ -1,4 +1,4 @@
-# InvenTree 群晖部署说明（DS920+ / amd64 / DSM 7.3.2）
+# InvenTree 说明（DS920+ / amd64 / DSM 7.3.2）
 
 访问地址：`http://192.168.1.188:1337`（HTTP 直连，不启用 TLS，避开 DSM 的 80/443）
 
@@ -50,8 +50,9 @@ sudo docker compose up -d
 
 ## 六、物料主数据插件 weiti_mdm（自定义）
 
-本目录 `plugins/weiti_mdm/` 是物料主数据插件（类别/选项编号 + IPN + BOM导入），
-`scripts/assign_ipns.py` 是存量零件批量补码脚本。
+本目录 `plugins/weiti_mdm/` 是物料主数据插件（类别/选项编号 + IPN + BOM导入/导出），
+`scripts/assign_ipns.py` 是存量零件批量补码脚本，
+`scripts/backfill_params.py` 是存量零件补建类别参数行脚本。
 
 ### 部署
 
@@ -115,25 +116,52 @@ IPN = {小类码}-{规格段}   例: 102-030110301（无流水号，同规格同
 > 存量老零件（插件部署前已导入的）不会自动回溯，需重新保存一次触发，
 > 或用维护脚本 `scripts/extract_params.py` 批量处理（支持 `--dry-run`/`--category`/`--overwrite`）。
 
-### BOM 一键导入（去重 + 增量建零件）
+### BOM 一键导入（多工作表 + 去重 + 增量建零件）
 
 插件页面地址：`http://192.168.1.188:1337/plugin/weiti_mdm/bom-import/`
-（需以员工 staff 身份登录）。
+（需以员工 staff 身份登录）。零件详情页也有「BOM导入」按钮直达。
 
-流程：
-1. **上传**：选 BOM 文件（xlsx/xls/csv）+ 填父零件（ID/IPN/名称）；
-2. **映射列**：页面自动检测列名并猜默认映射，确认「组件名称/数量/规格/类别/位号」对应列；
-3. **预览**：点「预览」跑 dry-run（不落库），看将新建/复用/挂行/失败；
+#### 多工作表语义
+
+一个 Excel 可含多个 tab，**每个 tab 是一个装配体的 BOM**，表头在前 3 行内自动识别（首行是标题/说明也能跳过）。父零件框决定层级：
+
+- **留空**：每个 tab 按表名（去掉 `BOM` 及之后内容）各建/复用一个**成品类父零件**，行挂到各自下面。
+  例：`间隙传感器BOM清单` → 零件「间隙传感器」
+- **填写**（ID/IPN/名称，详情页按钮带入）：每个 tab 按表名各建/复用一个**子装配件**，
+  先作为 `x1` 的 BOM 行挂到该父零件下，再把表内各行挂到子装配件下。
+  例：父零件=间隙采集系统 → 其 BOM 下出现 间隙传感器/轮毂配电柜线材/… 各 x1。
+
+父零件在**确认导入时才真正创建**（上传和预览只探测不落库；预览时临时建完即回滚）。
+同名循环挂载（子件名 = 父件名 或会成环）会被拦截并在报告中标记失败。
+
+#### 流程
+
+1. **上传**：选 BOM 文件（xlsx/xls/csv）；父零件可留空；
+2. **映射列**：每个 tab 一张卡片独立配置（名称必填，数量/规格多选/类别可选），
+   每卡片只预览前 3 行；列名自动猜测（类别列优先「类别」、其次「类型」）；
+   **位号列不配置**——表头含 `位号/ref/designator` 自动写入 BOM 位号；
+3. **预览**：dry-run 不落库，按工作表分组展示：每组的父零件、新建/复用/BOM行/失败小计、
+   明细行（行号/名称/动作/类别/说明）；指定父零件时组内第一行是 `link` 挂载行；
 4. **确认导入**：核对无误后落库。
 
 去重键 = **名称 + IPN 特征段**：同名且规格特征相同 → 复用；同名但规格不同 → 另建。
-缺料零件自动建档（类别走归类逻辑 → 自动 IPN），规格写入描述并反解参数。
+缺料零件自动建档（类别走归类逻辑 → 自动 IPN），规格写入描述并反解参数；
+新建零件自动**复制类别参数模板**（等价于网页建件时勾"复制类别参数"）。
 
-**缺失类别确认**：预览页会列出 Excel 中匹配不到系统的类别，逐个可选
-「新建到某大类下（自动编号）/ 映射到已有类别 / 不归类」；
+**图片**：单元格内嵌图片（WPS `DISPIMG` 及常规浮动图）随零件导入 `part.image`，
+逐表独立映射行号互不串；零件已有图则跳过。
+
+**缺失类别确认**：预览页列出匹配不到的类别文本，逐个可选
+「新建到某大类下（自动编号）/ 映射到已有类别（大类分组标题不可选）/ 不归类」；
 确认导入时先建类别、再建零件、最后挂 BOM。
 
-> 依赖插件文件：`bom_import.py` 与 `templates/weiti_mdm/*.html`，
+#### BOM 导出（对称能力）
+
+零件详情页按钮：**导出BOM**（本件 1 个 tab）、**导出BOM树**（递归所有下级装配体，
+每个一个 tab，含嵌入图片）。另有手工多选导出：
+`/plugin/weiti_mdm/bom-export-multi/?pks=1,2,3`。
+
+> 依赖插件文件：`bom_import.py`、`bom_export.py` 与 `templates/weiti_mdm/*.html`，
 > 与 `__init__.py` 一起放在 `plugins/weiti_mdm/` 下，改动后重启容器。
 
 ### 存量零件批量补码
@@ -146,6 +174,19 @@ sudo docker exec -it inventree-server \
 # 确认无误后正式执行：
 sudo docker exec -it inventree-server \
     python /home/inventree/data/scripts/assign_ipns.py
+```
+
+### 存量零件补建参数行
+
+插件 ORM 直建的零件不会自动复制类别参数模板（API 建件才有），
+导致参数页无字段可填。补跑（幂等，已齐的自动跳过）：
+
+```bash
+sudo docker exec -it inventree-server \
+    python /home/inventree/data/scripts/backfill_params.py --dry-run
+
+sudo docker exec -it inventree-server \
+    python /home/inventree/data/scripts/backfill_params.py
 ```
 
 ### 注意
