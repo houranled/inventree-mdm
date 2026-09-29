@@ -1058,6 +1058,7 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                     'idx': idx, 'sheet': s['sheet'], 'headers': s['headers'],
                     'parent_pk': parent_pk, 'pname': pname,
                     'pipn': pipn, 'auto': pa, 'rows': len(srows),
+                    'checked': True,
                     'preview': [[r.get(h, '') for h in s['headers']]
                                 for r in srows[:3]],
                     'guess': g,
@@ -1089,6 +1090,10 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                      {int(k): v for k, v in (m.get('imgs') or {}).items()}))
             all_rows = [r for _m, _h, rows, _i in sheet_data for r in rows]
 
+            fixed_pk = request.session.get('bom_fixed') or ''
+            fixed_obj = (self._resolve_parent(str(fixed_pk))
+                         if fixed_pk else None)
+
             # 每个工作表独立一套列映射：字段名带 _{idx} 后缀
             # 位号列不做映射配置：逐表按关键词自动识别
             ref_kw = ('位号', 'ref', 'designator')
@@ -1102,8 +1107,19 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                     (h for h in hdrs
                      if any(k in str(h).lower() for k in ref_kw)), '')
                 mappings.append(mp)
-            if any(not mp['name'] for mp in mappings):
-                # 重渲染映射页，保留用户已选的列
+
+            # 逐表勾选导入：use_{idx} 未勾选则整表跳过
+            enabled = [bool(request.POST.get(f'use_{idx}'))
+                       for idx in range(len(sheet_data))]
+            if not any(enabled):
+                err = '请至少勾选一个要导入的工作表'
+            elif any(not mp['name'] for idx, mp in enumerate(mappings)
+                     if enabled[idx]):
+                err = '每个待导入工作表都必须指定「组件名称」列'
+            else:
+                err = None
+            if err:
+                # 重渲染映射页，保留用户已选的列和勾选状态
                 sheets_view = []
                 for idx, (m, hdrs, rows, _i) in enumerate(sheet_data):
                     mp = mappings[idx]
@@ -1111,29 +1127,28 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                         'idx': idx, 'sheet': m['sheet'], 'headers': hdrs,
                         'parent_pk': m['parent_pk'], 'pname': m['pname'],
                         'pipn': m['pipn'], 'auto': m['auto'],
-                        'rows': len(rows),
+                        'rows': len(rows), 'checked': enabled[idx],
                         'preview': [[r.get(h, '') for h in hdrs]
                                     for r in rows[:3]],
                         'guess': mp, 'spec_sel': mp['spec']})
                 ctx.update({'sheets_view': sheets_view,
                             'row_count': len(all_rows),
                             'parent': fixed_obj,
-                            'error': '每个工作表都必须指定「组件名称」列'})
+                            'error': err})
                 return self._render(request, 'bom_map.html', ctx)
 
             def collect_missing():
-                """跨所有工作表收集缺失类别（按各自映射的类别列）。"""
+                """跨勾选的工作表收集缺失类别（按各自映射的类别列）。"""
                 miss = []
-                for (_m, _h, rows, _i), mp in zip(sheet_data, mappings):
+                for idx, ((_m, _h, rows, _i), mp) in enumerate(
+                        zip(sheet_data, mappings)):
+                    if not enabled[idx]:
+                        continue
                     for c in bom_import.missing_categories(
                             rows, mp['category']):
                         if c not in miss:
                             miss.append(c)
                 return miss
-
-            fixed_pk = request.session.get('bom_fixed') or ''
-            fixed_obj = (self._resolve_parent(str(fixed_pk))
-                         if fixed_pk else None)
 
             def run_all(dry):
                 """逐工作表跑 run_import，汇总报告 + 按表分组明细。
@@ -1190,6 +1205,15 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                     return sub
 
                 for idx, (m, _h, rows, imgs) in enumerate(sheet_data):
+                    if not enabled[idx]:
+                        rep['groups'].append({
+                            'sheet': m['sheet'], 'parent_pk': m['parent_pk'],
+                            'pname': m['pname'], 'pipn': m['pipn'],
+                            'auto': m['auto'], 'skipped': True,
+                            'sub': {'created': 0, 'reused': 0,
+                                    'bom_rows': 0, 'failed': 0,
+                                    'lines': []}})
+                        continue
                     try:
                         with transaction.atomic():
                             sub = run_sheet(m, rows, imgs,
@@ -1228,8 +1252,11 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
             if action == 'preview':
                 report = run_all(dry=True)
                 # 映射字段平铺成 hidden input，提交时原样带回
+                # use_{idx} 只给勾选的表回传：未勾选即提交时跳过
                 mfields = []
                 for idx, mp in enumerate(mappings):
+                    if enabled[idx]:
+                        mfields.append((f'use_{idx}', '1'))
                     for k in ('name', 'qty', 'ref', 'category'):
                         mfields.append((f'col_{k}_{idx}', mp[k]))
                     for s in mp['spec']:
@@ -1340,6 +1367,7 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                 sheets_view.append({
                     'idx': idx, 'sheet': s['sheet'],
                     'headers': s['headers'], 'rows': len(srows),
+                    'checked': True,
                     'preview': [[r.get(h, '') for h in s['headers']]
                                 for r in srows[:3]],
                     'guess': supplier_import.guess_columns(s['headers'])})
@@ -1373,26 +1401,42 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
             mappings = [{k: request.POST.get(f'scol_{k}_{idx}', '')
                          for k in supplier_import.MAP_FIELDS}
                         for idx in range(len(sheet_data))]
-            if any(not mp['part'] or not mp['supplier'] for mp in mappings):
+
+            # 逐表勾选导入：use_{idx} 未勾选则整表跳过
+            enabled = [bool(request.POST.get(f'use_{idx}'))
+                       for idx in range(len(sheet_data))]
+            if not any(enabled):
+                err = '请至少勾选一个要导入的工作表'
+            elif any(not mp['part'] or not mp['supplier']
+                     for idx, mp in enumerate(mappings) if enabled[idx]):
+                err = ('每个待导入工作表都必须指定'
+                       '「零件标识」和「供应商」列')
+            else:
+                err = None
+            if err:
                 sheets_view = []
                 for idx, (m, hdrs, rows) in enumerate(sheet_data):
                     sheets_view.append({
                         'idx': idx, 'sheet': m['sheet'], 'headers': hdrs,
-                        'rows': m['rows'],
+                        'rows': m['rows'], 'checked': enabled[idx],
                         'preview': [[r.get(h, '') for h in hdrs]
                                     for r in rows[:3]],
                         'guess': mappings[idx]})
                 ctx.update({'sheets_view': sheets_view,
                             'row_count': sum(m['rows'] for m in meta),
-                            'currency': currency,
-                            'error': ('每个工作表都必须指定'
-                                      '「零件标识」和「供应商」列')})
+                            'currency': currency, 'error': err})
                 return self._render(request, 'sup_map.html', ctx)
 
             dry = action == 'preview'
             report = {'created': 0, 'reused': 0, 'prices': 0,
                       'failed': 0, 'groups': []}
             for idx, (m, _h, rows) in enumerate(sheet_data):
+                if not enabled[idx]:
+                    report['groups'].append({
+                        'sheet': m['sheet'], 'skipped': True,
+                        'sub': {'created': 0, 'reused': 0, 'prices': 0,
+                                'failed': 0, 'lines': []}})
+                    continue
                 try:
                     with transaction.atomic():
                         sub = supplier_import.run_import(
@@ -1420,6 +1464,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
             if dry:
                 mfields = []
                 for idx, mp in enumerate(mappings):
+                    if enabled[idx]:
+                        mfields.append((f'use_{idx}', '1'))
                     for k in supplier_import.MAP_FIELDS:
                         mfields.append((f'scol_{k}_{idx}', mp[k]))
                 mfields.append(('currency', currency))

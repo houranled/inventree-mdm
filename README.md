@@ -1,4 +1,4 @@
-# InvenTree 说明（DS920+ / amd64 / DSM 7.3.2）
+# InvenTree 说明+微体物料业务插件weiti_mdm（DS920+ / amd64 / DSM 7.3.2）
 
 访问地址：`http://192.168.1.188:1337`（HTTP 直连，不启用 TLS，避开 DSM 的 80/443）
 

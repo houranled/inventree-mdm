@@ -20,6 +20,7 @@
     .reused { background: #e8f0fe; color: #1967d2; }
     .error { background: #fce8e6; color: #c5221f; }
     .link { background: #f3e8fd; color: #6b21a8; }
+    .skip { background: #ececec; color: #666; }
     .banner { padding: 12px 16px; border-radius: 6px; margin: 12px 0; }
     h2.grp { font-size: 15px; margin: 22px 0 4px; padding-top: 12px;
              border-top: 2px solid #e2e2e2; }
@@ -56,7 +57,9 @@
   {% for g in report.groups %}
   <h2 class="grp">「{{ g.sheet }}」 → {% if g.parent_pk %}#{{ g.parent_pk }} {% endif %}{{ g.pname }}{% if g.pipn %} ({{ g.pipn }}){% endif %}
     {% if g.auto == 'reused' %}<span class="tag reused">复用已有</span>{% elif g.auto == 'will_create' %}<span class="tag created">将新建</span>{% endif %}
+    {% if g.skipped %}<span class="tag skip">已跳过（未勾选导入）</span>{% endif %}
   </h2>
+  {% if not g.skipped %}
   <p class="hint">新建 {{ g.sub.created }} · 复用 {{ g.sub.reused }} · BOM 行 {{ g.sub.bom_rows }} · 失败 {{ g.sub.failed }}</p>
   <table>
     <tr><th>行</th><th>名称</th><th>动作</th><th>类别</th><th>说明</th></tr>
@@ -70,6 +73,7 @@
     </tr>
     {% endfor %}
   </table>
+  {% endif %}
   {% endfor %}
 
   {% if dry_run %}

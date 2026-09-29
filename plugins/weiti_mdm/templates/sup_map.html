@@ -21,6 +21,9 @@
     th { background: #f6f8fa; }
     .err { background: #fdecea; color: #b3261e; padding: 10px 14px; border-radius: 6px; margin-top: 12px; }
     .cur { max-width: 140px; display: inline-block; margin-left: 8px; }
+    .use { display: inline; margin: 0 10px 0 0; font-weight: 600; }
+    .use input { margin-right: 4px; }
+    .card.off .grid, .card.off table, .card.off .hint { opacity: .4; }
   </style>
 </head>
 <body>
@@ -49,18 +52,19 @@
 
     {% for s in sheets_view %}
     <div class="card">
-      <h2 class="sheet">「{{ s.sheet }}」 — {{ s.rows }} 行</h2>
+      <h2 class="sheet"><label class="use"><input type="checkbox" class="use-cb" name="use_{{ s.idx }}" value="1"{% if s.checked %} checked{% endif %}>导入此表</label>
+        「{{ s.sheet }}」 — {{ s.rows }} 行</h2>
       <div class="grid">
         <div>
           <label>零件标识列 *（IPN 或名称）</label>
-          <select name="scol_part_{{ s.idx }}" required>
+          <select name="scol_part_{{ s.idx }}" data-req="1" required>
             <option value="">— 请选择 —</option>
             {% for h in s.headers %}<option value="{{ h }}" {% if s.guess.part == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
           </select>
         </div>
         <div>
           <label>供应商列 *</label>
-          <select name="scol_supplier_{{ s.idx }}" required>
+          <select name="scol_supplier_{{ s.idx }}" data-req="1" required>
             <option value="">— 请选择 —</option>
             {% for h in s.headers %}<option value="{{ h }}" {% if s.guess.supplier == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
           </select>
@@ -117,5 +121,19 @@
     {% endfor %}
     <button class="btn" type="submit">预览（不落库）</button>
   </form>
+  <script>
+    // 取消勾选的表：置灰 + 摘掉必填，不再校验列映射
+    document.querySelectorAll('.use-cb').forEach(function (cb) {
+      var card = cb.closest('.card');
+      function sync() {
+        card.classList.toggle('off', !cb.checked);
+        card.querySelectorAll('select[data-req]').forEach(function (s) {
+          s.required = cb.checked;
+        });
+      }
+      cb.addEventListener('change', sync);
+      sync();
+    });
+  </script>
 </body>
 </html>

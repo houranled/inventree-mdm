@@ -20,6 +20,9 @@
     th, td { border: 1px solid #e2e2e2; padding: 6px 8px; text-align: left; }
     th { background: #f6f8fa; }
     .err { background: #fdecea; color: #b3261e; padding: 10px 14px; border-radius: 6px; margin-top: 12px; }
+    .use { display: inline; margin: 0 10px 0 0; font-weight: 600; }
+    .use input { margin-right: 4px; }
+    .card.off .grid, .card.off table, .card.off .hint { opacity: .4; }
   </style>
 </head>
 <body>
@@ -38,13 +41,14 @@
     <input type="hidden" name="action" value="preview">
     {% for s in sheets_view %}
     <div class="card">
-      <h2 class="sheet">「{{ s.sheet }}」 → {% if s.parent_pk %}#{{ s.parent_pk }} {% endif %}{{ s.pname }}{% if s.pipn %} ({{ s.pipn }}){% endif %}
+      <h2 class="sheet"><label class="use"><input type="checkbox" class="use-cb" name="use_{{ s.idx }}" value="1"{% if s.checked %} checked{% endif %}>导入此表</label>
+        「{{ s.sheet }}」 → {% if s.parent_pk %}#{{ s.parent_pk }} {% endif %}{{ s.pname }}{% if s.pipn %} ({{ s.pipn }}){% endif %}
         {% if s.auto == 'reused' %}<b>[复用已有零件]</b>{% elif s.auto %}<b>[提交时新建]</b>{% endif %}
         — {{ s.rows }} 行</h2>
       <div class="grid">
         <div>
           <label>组件名称列 *</label>
-          <select name="col_name_{{ s.idx }}" required>
+          <select name="col_name_{{ s.idx }}" data-req="1" required>
             <option value="">— 请选择 —</option>
             {% for h in s.headers %}<option value="{{ h }}" {% if s.guess.name == h %}selected{% endif %}>{{ h }}</option>{% endfor %}
           </select>
@@ -81,5 +85,19 @@
     {% endfor %}
     <button class="btn" type="submit">预览（不落库）</button>
   </form>
+  <script>
+    // 取消勾选的表：置灰 + 摘掉必填，不再校验列映射
+    document.querySelectorAll('.use-cb').forEach(function (cb) {
+      var card = cb.closest('.card');
+      function sync() {
+        card.classList.toggle('off', !cb.checked);
+        card.querySelectorAll('select[data-req]').forEach(function (s) {
+          s.required = cb.checked;
+        });
+      }
+      cb.addEventListener('change', sync);
+      sync();
+    });
+  </script>
 </body>
 </html>
