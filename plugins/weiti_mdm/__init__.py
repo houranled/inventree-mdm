@@ -919,6 +919,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                  name='pending-parts'),
             path('schedule/', self.view_schedule_board,
                  name='schedule-board'),
+            path('part-po/<int:pk>/', self.view_part_po,
+                 name='part-po'),
         ]
 
     # ---------- 零件详情页"BOM导入"按钮（primary_action UI 特性） ----------
@@ -956,6 +958,14 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                 'icon': 'ti:file-export:outline',
                 'options': {'color': 'orange'},
                 'context': {'url': f'/plugin/weiti_mdm/bom-export/{pk}/'},
+                'source': '/plugin/weiti_mdm/bom-import.js',
+            })
+            actions.append({
+                'key': 'weiti-part-po',
+                'title': '按BOM采购',
+                'icon': 'ti:building-store:outline',
+                'options': {'color': 'blue'},
+                'context': {'url': f'/plugin/weiti_mdm/part-po/{pk}/'},
                 'source': '/plugin/weiti_mdm/bom-import.js',
             })
             # 子件里有装配体 → 再加"导出BOM树"（多 tab 整树导出）
@@ -1015,6 +1025,99 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             'context': {'url': '/plugin/weiti_mdm/schedule/'},
             'source': src,
         }]
+
+    # ---------- 订单详情页"关联订单"面板 ----------
+
+    def get_ui_panels(self, request, context, **kwargs):
+        """订单详情页面板：展示插件自动生成的关联订单（双向）。
+
+        正向：BO/SO 详情页 → "关联采购单"列出 metadata 溯源的 PO。
+        反向：PO 详情页 → "来源订单"跳回生成它的 BO/SO。
+        context 为 QueryDict：target_model + target_id。
+        """
+        if not (request.user and request.user.is_staff):
+            return []
+        context = context or {}
+        model, pk = context.get('target_model'), context.get('target_id')
+        if not pk:
+            return []
+        src = '/plugin/weiti_mdm/bom-import.js:renderOrderLinksPanel'
+        try:
+            pk = int(pk)
+        except (TypeError, ValueError):
+            return []
+        panels = []
+        try:
+            if model in ('build', 'salesorder'):
+                # 正向：该订单自动生成了哪些 PO
+                from order.models import PurchaseOrder
+                kind = {'build': 'Build', 'salesorder': 'SalesOrder'}[model]
+                pos = PurchaseOrder.objects.filter(
+                    metadata__weiti_source='%s:%s' % (kind, pk))
+                orders = [
+                    {'pk': p.pk, 'ref': p.reference,
+                     'extra': str(p.supplier.name) if p.supplier else ''}
+                    for p in pos.select_related('supplier')]
+                if orders:
+                    panels.append({
+                        'key': 'weiti-linked-pos',
+                        'title': '关联采购单',
+                        'icon': 'ti:building-store:outline',
+                        'context': {'kind': 'po', 'orders': orders},
+                        'source': src})
+            elif model == 'purchaseorder':
+                # 反向：这张 PO 是为哪张单生成的
+                from order.models import PurchaseOrder
+                po = PurchaseOrder.objects.get(pk=pk)
+                src_tag = (po.metadata or {}).get('weiti_source', '')
+                if ':' in src_tag:
+                    kind, src_pk = src_tag.split(':', 1)
+                    ui_kind = {'Build': 'build',
+                               'SalesOrder': 'salesorder',
+                               'Part': 'part'}.get(kind)
+                    if ui_kind:
+                        ref = src_tag
+                        try:
+                            # 取来源对象的真实单号/编码显示
+                            if kind == 'Part':
+                                from part.models import Part
+                                ref = (Part.objects.get(pk=src_pk).IPN
+                                       or src_tag)
+                            elif kind == 'Build':
+                                from build.models import Build
+                                ref = Build.objects.get(pk=src_pk).reference
+                            elif kind == 'SalesOrder':
+                                from order.models import SalesOrder
+                                ref = SalesOrder.objects.get(
+                                    pk=src_pk).reference
+                        except Exception:
+                            pass
+                        panels.append({
+                            'key': 'weiti-source-order',
+                            'title': '来源订单',
+                            'icon': 'ti:link:outline',
+                            'context': {'kind': ui_kind, 'orders': [
+                                {'pk': src_pk, 'ref': ref, 'extra': ''}]},
+                            'source': src})
+            elif model == 'part':
+                # 零件页反向：哪些 PO 是从该零件"按BOM采购"生成的
+                from order.models import PurchaseOrder
+                pos = PurchaseOrder.objects.filter(
+                    metadata__weiti_source='Part:%s' % pk)
+                orders = [
+                    {'pk': p.pk, 'ref': p.reference,
+                     'extra': str(p.supplier.name) if p.supplier else ''}
+                    for p in pos.select_related('supplier')]
+                if orders:
+                    panels.append({
+                        'key': 'weiti-linked-pos',
+                        'title': '关联采购单',
+                        'icon': 'ti:building-store:outline',
+                        'context': {'kind': 'po', 'orders': orders},
+                        'source': src})
+        except Exception:
+            pass
+        return panels
 
     # ---------- 首页 Dashboard 卡片 ----------
 
@@ -1107,6 +1210,40 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                 'prog': prog})
         ctx = {'plugin': self, 'parts': rows}
         return self._render(request, 'pending_parts.html', ctx)
+
+    # ---------- 零件级"按BOM采购" ----------
+
+    def view_part_po(self, request, pk):
+        """零件页"按BOM生成采购单"：GET 预览缺口，POST 确认建单。"""
+        from decimal import Decimal as D
+        from django.http import HttpResponse, HttpResponseForbidden
+        from part.models import Part
+        import orderflow
+
+        if not (request.user.is_authenticated and request.user.is_staff):
+            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        try:
+            part = Part.objects.get(pk=pk)
+        except Part.DoesNotExist:
+            return HttpResponse('零件不存在', status=404)
+
+        try:
+            qty = D(request.POST.get('qty')
+                    or request.GET.get('qty') or '1')
+        except Exception:
+            qty = D('1')
+        buy, skipped = orderflow.collect_bom_purchasables(part, qty)
+        for e in buy:  # 预览带上供应商/SKU
+            sp = e['part'].supplier_parts.filter(
+                supplier__active=True, supplier__is_supplier=True
+            ).order_by('pk').first()
+            e['supplier'] = sp.supplier.name if sp else None
+            e['sku'] = sp.SKU if sp else ''
+            e['ok'] = bool(sp)
+        ctx = {'part': part, 'qty': qty, 'buy': buy, 'skipped': skipped}
+        if request.method == 'POST' and request.POST.get('action') == 'create':
+            ctx['created'] = orderflow.create_pos_for_part(self, buy, part)
+        return self._render(request, 'part_po.html', ctx)
 
     # ---------- 排单看板 ----------
 
@@ -1242,6 +1379,38 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             "line-height:1\">' + n + '</span>'\n"
             "    + '<span style=\"color:#888;font-size:13px\">"
             "个零件待完善编码，点击查看清单</span></a>';\n"
+            "}\n"
+            "export function renderOrderLinksPanel(target, ctx) {\n"
+            "  if (!target) { return; }\n"
+            "  var c = (ctx && ctx.context) || {};\n"
+            "  var orders = c.orders || [];\n"
+            "  var paths = {po:'/web/purchasing/purchase-order/',\n"
+            "    build:'/web/manufacturing/build-order/',\n"
+            "    salesorder:'/web/sales/sales-order/',\n"
+            "    part:'/web/part/'};\n"
+            "  var base = paths[c.kind] || '/web/';\n"
+            "  if (!orders.length) {\n"
+            "    target.innerHTML = '<div style=\"color:#888\">暂无</div>';\n"
+            "    return;\n"
+            "  }\n"
+            "  var html = '<div style=\"display:flex;flex-direction:column;"
+            "gap:8px\">';\n"
+            "  for (var i = 0; i < orders.length; i++) {\n"
+            "    var o = orders[i];\n"
+            "    var ref = String(o.ref || '#' + o.pk)\n"
+            "      .replace(/&/g,'&amp;').replace(/</g,'&lt;');\n"
+            "    var extra = String(o.extra || '')\n"
+            "      .replace(/&/g,'&amp;').replace(/</g,'&lt;');\n"
+            "    html += '<a href=\"' + base + o.pk + '/\" "
+            "style=\"display:block;padding:8px 12px;"
+            "border:1px solid #dee2e6;border-radius:8px;"
+            "text-decoration:none;color:inherit\">'\n"
+            "      + '<b>' + ref + '</b>'\n"
+            "      + (extra ? ' <span style=\"color:#888\">· ' + extra\n"
+            "        + '</span>' : '')\n"
+            "      + '</a>';\n"
+            "  }\n"
+            "  target.innerHTML = html + '</div>';\n"
             "}\n")
         resp = HttpResponse(js, content_type='application/javascript')
         resp['Cache-Control'] = 'no-cache'

@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>按BOM生成采购单</title>
+  <style>
+    body { font-family: system-ui, "Microsoft YaHei", sans-serif;
+           max-width: 960px; margin: 32px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 20px; }
+    h3 { font-size: 15px; margin-top: 20px; }
+    .hint { color: #888; font-size: 13px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px;
+            font-size: 13px; }
+    th, td { border: 1px solid #e2e2e2; padding: 6px 8px; text-align: left; }
+    th { background: #f6f8fa; }
+    .ipn { font-family: ui-monospace, monospace; }
+    .bad { color: #b3261e; }
+    a.plain { color: #2f6feb; text-decoration: none; }
+    input[type=number] { width: 80px; padding: 4px; }
+    button { padding: 6px 18px; }
+  </style>
+</head>
+<body>
+  <h1>按BOM生成采购单 — {{ part.IPN }} {{ part.name }}</h1>
+  <p class="hint">逐层下钻到最底层可采购件；净缺口 = 需求 − 可用库存 − 在产 − 在途采购。</p>
+
+  <form method="get">
+    生产/备货数量：<input type="number" name="qty" min="1" step="1"
+      value="{{ qty }}">
+    <button type="submit">重算预览</button>
+  </form>
+
+  {% if created %}
+    <h3>已生成采购单</h3>
+    <table>
+      <tr><th>采购单</th><th>供应商</th><th>目标日期</th><th></th></tr>
+      {% for po in created %}
+      <tr>
+        <td><b>{{ po.reference }}</b></td>
+        <td>{{ po.supplier.name }}</td>
+        <td>{{ po.target_date|default:"—" }}</td>
+        <td><a class="plain"
+          href="/web/purchasing/purchase-order/{{ po.pk }}/">打开 →</a></td>
+      </tr>
+      {% endfor %}
+    </table>
+  {% endif %}
+
+  {% if buy %}
+  <h3>需采购（{{ buy|length }} 项）</h3>
+  <form method="post">{% csrf_token %}
+    <input type="hidden" name="qty" value="{{ qty }}">
+    <input type="hidden" name="action" value="create">
+    <table>
+      <tr><th>IPN</th><th>名称</th><th>需求</th><th>净缺口</th>
+          <th>供应商</th><th>SKU</th></tr>
+      {% for e in buy %}
+      <tr>
+        <td class="ipn">{{ e.part.IPN }}</td>
+        <td>{{ e.part.name }}</td>
+        <td>{{ e.need }}</td>
+        <td><b>{{ e.qty }}</b></td>
+        <td>{{ e.supplier|default:"—" }}</td>
+        <td>{{ e.sku }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    <p style="margin-top:12px">
+      <button type="submit">按供应商分组生成采购单</button>
+      <span class="hint">无供应商的项会被跳过并记日志</span>
+    </p>
+  </form>
+  {% else %}
+    <p class="hint" style="margin-top:16px">
+      没有需要采购的叶子件（库存充足或子件均不可采购）。</p>
+  {% endif %}
+
+  {% if skipped %}
+  <h3>跳过项（{{ skipped|length }}）</h3>
+  <table>
+    <tr><th>IPN</th><th>名称</th><th>需求</th><th>原因</th></tr>
+    {% for s in skipped %}
+    <tr>
+      <td class="ipn">{{ s.part.IPN }}</td>
+      <td>{{ s.part.name }}</td>
+      <td>{{ s.need }}</td>
+      <td class="bad">{{ s.reason }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+
+  <p style="margin-top:20px">
+    <a class="plain" href="/web/part/{{ part.pk }}/">← 返回零件</a> ·
+    <a class="plain" href="/plugin/weiti_mdm/schedule/">排单看板</a>
+  </p>
+</body>
+</html>

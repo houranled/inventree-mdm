@@ -26,6 +26,17 @@ META_SHORT = 'weiti_shortages'
 META_PRIO = 'weiti_priority'
 META_SRC = 'weiti_source'
 
+# 来源对象的 PUI 详情页路径（相对路径，写入 PO.link 后可点击跳回）
+_SRC_URLS = {'Build': '/web/manufacturing/build-order/%s/',
+             'SalesOrder': '/web/sales/sales-order/%s/',
+             'Part': '/web/part/%s/'}
+
+
+def _src_ref(obj):
+    """来源显示名：订单用 reference，零件用 IPN/名称。"""
+    return (getattr(obj, 'reference', None)
+            or getattr(obj, 'IPN', None) or str(obj))
+
 WATCHED_EVENTS = frozenset([
     'salesorder.issued',
     'salesorder.cancelled',
@@ -303,22 +314,28 @@ def _create_po_lines(plugin, items, source_order, need_by):
                                            'lines': []})['lines'].append(
             (sp, part, qty))
     created = []
+    src_kind = source_order.__class__.__name__
+    tpl = _SRC_URLS.get(src_kind, '')
+    src_url = tpl % source_order.pk if tpl else ''
+    src_ref = _src_ref(source_order)
     for g in groups.values():
         po = PurchaseOrder.objects.create(
             supplier=g['supplier'],
+            description='自动生成：为 %s 采购缺料' % src_ref,
+            link=src_url,
             responsible=_responsible_of(source_order),
             target_date=need_by,
             project_code=getattr(source_order, 'project_code', None),
-            metadata={META_SRC: '%s:%s' % (
-                source_order.__class__.__name__, source_order.pk)})
+            metadata={META_SRC: '%s:%s' % (src_kind, source_order.pk)})
         for sp, part, qty in g['lines']:
             PurchaseOrderLineItem.objects.create(
                 order=po, part=sp, quantity=qty,
                 target_date=need_by,
-                reference=str(part.IPN or ''))
+                reference=str(part.IPN or ''),
+                notes='来源 %s' % src_ref)
         created.append(po)
         logger.info('WeiTiMDM: 自动生成采购单 %s (%d 行, 来源 %s)',
-                    po.reference, len(g['lines']), source_order.reference)
+                    po.reference, len(g['lines']), src_ref)
     return created
 
 
@@ -617,3 +634,53 @@ def task_check_build(build_id):
         compute_priorities(plugin)
     except Exception:
         logger.exception('WeiTiMDM: BO %s 异步检查失败', build_id)
+
+
+# ------------------------------------------------------------------
+# 零件级"按BOM采购"
+# ------------------------------------------------------------------
+
+def collect_bom_purchasables(part, qty):
+    """逐层下钻 BOM 到叶子可采购件。
+
+    规则：子件有下层 BOM → 继续下钻（按制造算）；
+          叶子且 purchaseable → 计入采购需求（跨分支聚合后算净缺口）；
+          叶子且不可采购 → 记入跳过清单。
+    返回 (buy, skipped)：
+      buy     = [{'part','need','qty'}]  qty=净缺口(扣可用/在产/在途)
+      skipped = [{'part','need','reason'}]
+    """
+    agg, skipped = {}, []
+
+    def walk(p, factor, path):
+        for it in p.bom_items.select_related('sub_part').all():
+            sub = it.sub_part
+            if not sub or sub.pk in path:  # path 防御 BOM 环
+                continue
+            need = Decimal(str(it.quantity)) * Decimal(str(factor))
+            if sub.bom_items.exists():
+                walk(sub, need, path | {sub.pk})
+            elif sub.purchaseable:
+                agg.setdefault(
+                    sub.pk, {'part': sub, 'need': Decimal(0)}
+                )['need'] += need
+            else:
+                skipped.append({'part': sub, 'need': need,
+                                'reason': '无下层BOM且未勾选可购买'})
+
+    walk(part, Decimal(str(qty)), {part.pk})
+    buy = []
+    for e in agg.values():
+        gap = _uncovered(e['part'], e['need'])
+        if gap > 0:
+            e['qty'] = gap
+            buy.append(e)
+        else:
+            skipped.append({'part': e['part'], 'need': e['need'],
+                            'reason': '库存/在途已覆盖'})
+    return buy, skipped
+
+
+def create_pos_for_part(plugin, items, part, need_by=None):
+    """零件级"按BOM采购"入口：source 为 Part，复用 _create_po_lines。"""
+    return _create_po_lines(plugin, items, part, need_by or _today())

@@ -267,6 +267,15 @@ PO 到货 / 库存变动        → 未齐套订单自动重查
   看板页 `/plugin/weiti_mdm/schedule/`（Ctrl+K 搜「排单看板」，
   或仪表盘「急单提醒」卡片），页面有「重算优先级」按钮；
   另有每日定时任务全量兜底。
+- **订单关联溯源**：生成的 PO 在描述里写明来源（"自动生成：为
+  BO-0007 采购缺料"），`link` 字段可点击跳回来源订单，行项目
+  `notes` 记来源单号；详情页另有面板：BO/SO 页显示「关联采购单」
+  列表，PO 页显示「来源订单」。
+- **零件级"按BOM采购"**：有 BOM 的零件详情页标题栏出现
+  「按BOM采购」按钮 → `/plugin/weiti_mdm/part-po/<pk>/` 预览页。
+  输入备货数量后**逐层下钻到最底层可采购件**（有下层 BOM 的子件
+  视为制造继续下钻），净缺口按供应商分组生成 PENDING 采购单；
+  无供应商/不可采购/库存已覆盖的项在"跳过项"中列明原因。
 
 **插件设置**（管理员中心 → 插件 → WeiTiMDM → 设置）：
 
@@ -279,7 +288,8 @@ PO 到货 / 库存变动        → 未齐套订单自动重查
 | `OF_MAKE_OR_BUY` | 交期打平兜底 | 外购 |
 | `OF_PRIO_*_W` | 优先级三项权重 | 1.0 / 1.0 / 0.5 |
 
-> 依赖插件文件：`orderflow.py`、`weiti_notify.py`、`templates/schedule_board.html`。
+> 依赖插件文件：`orderflow.py`、`weiti_notify.py`、
+> `templates/schedule_board.html`、`templates/part_po.html`。
 > 定时任务需系统设置开启 `ENABLE_PLUGINS_SCHEDULE`。
 
 ## 七、用户组权限建议（分组角色）
