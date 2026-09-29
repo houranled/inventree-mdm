@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>待完善编码零件</title>
+  <style>
+    body { font-family: system-ui, "Microsoft YaHei", sans-serif; max-width: 960px;
+           margin: 32px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 20px; }
+    .hint { color: #888; font-size: 13px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 16px; font-size: 13px; }
+    th, td { border: 1px solid #e2e2e2; padding: 6px 8px; text-align: left; }
+    th { background: #f6f8fa; }
+    .ipn { font-family: ui-monospace, monospace; color: #b3261e; }
+    a.plain { color: #2f6feb; text-decoration: none; }
+    .none { color: #888; margin-top: 24px; }
+  </style>
+</head>
+<body>
+  <h1>待完善编码零件 — {{ parts|length }} 个</h1>
+  <p class="hint">这些零件的 IPN 以 <b>!</b> 开头（规格参数未填齐）。打开零件页补齐类别参数后，IPN 会自动转为正式编码。</p>
+
+  {% if parts %}
+  <table>
+    <tr><th>IPN（临时）</th><th>名称</th><th>类别</th><th>参数已填</th><th></th></tr>
+    {% for p in parts %}
+    <tr>
+      <td class="ipn">{{ p.ipn }}</td>
+      <td>{{ p.name }}</td>
+      <td>{{ p.cat }}</td>
+      <td>{{ p.prog }}</td>
+      <td><a class="plain" href="/web/part/{{ p.pk }}/">打开 →</a></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="none">没有待完善的零件，所有 IPN 均已生效。</p>
+  {% endif %}
+
+  <p style="margin-top:20px;">
+    <a class="plain" href="/plugin/weiti_mdm/bom-import/">BOM 导入</a> ·
+    <a class="plain" href="/plugin/weiti_mdm/supplier-import/">供应商导入</a>
+  </p>
+</body>
+</html>

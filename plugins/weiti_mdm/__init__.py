@@ -801,8 +801,6 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                  name='bom-export-multi'),
             path('supplier-import/', self.view_supplier_import,
                  name='supplier-import'),
-            path('dashboard.js', self.view_dashboard_js,
-                 name='dashboard-js'),
             path('pending-parts/', self.view_pending_parts,
                  name='pending-parts'),
         ]
@@ -907,7 +905,7 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
             pending = Part.objects.filter(IPN__startswith='!').count()
         except Exception:
             pass
-        src = '/plugin/weiti_mdm/dashboard.js'
+        src = '/plugin/weiti_mdm/bom-import.js'
         pending_url = '/plugin/weiti_mdm/pending-parts/'
         return [{
             'key': 'weiti-mdm-tools',
@@ -955,31 +953,25 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
         return self._render(request, 'pending_parts.html', ctx)
 
     def view_bom_js(self, request):
-        """按钮/Spotlight 动作的 JS（整页跳转，非 SPA navigate）。
+        """全部 UI 特性的 JS（单一模块，已被按钮链路验证可加载）。
 
         getFeature:     详情页按钮，feature.context 作为 args.serverContext
         executeAction:  Spotlight 动作，feature.context 作为 args.context
-        """
-        from django.http import HttpResponse
-        js = ('export function getFeature(args) {\n'
-              '  if (args && args.serverContext && args.serverContext.url) {\n'
-              '    window.location.href = args.serverContext.url;\n'
-              '  }\n'
-              '}\n'
-              'export function executeAction(args) {\n'
-              '  var u = args && args.context && args.context.url;\n'
-              '  if (u) { window.location.href = u; }\n'
-              '}\n')
-        return HttpResponse(js, content_type='application/javascript')
-
-    def view_dashboard_js(self, request):
-        """Dashboard 卡片的渲染 JS。
-
-        两参函数走前端 legacy DOM 路径：fn(target, ctx)，
-        feature.context 位于 ctx.context。裸 JS（无 JSX 转译）。
+        renderXxxCard:  Dashboard 卡片，两参签名走前端 legacy DOM 路径：
+                        fn(target, ctx)，feature.context 位于 ctx.context。
+                        裸 JS（无 JSX 转译），用 :函数名 后缀指定入口。
         """
         from django.http import HttpResponse
         js = (
+            'export function getFeature(args) {\n'
+            '  if (args && args.serverContext && args.serverContext.url) {\n'
+            '    window.location.href = args.serverContext.url;\n'
+            '  }\n'
+            '}\n'
+            'export function executeAction(args) {\n'
+            '  var u = args && args.context && args.context.url;\n'
+            '  if (u) { window.location.href = u; }\n'
+            '}\n'
             "function linkBtn(url, title, desc) {\n"
             "  return '<a href=\"' + url + '\" style=\"display:block;"
             "padding:10px 12px;border:1px solid #dee2e6;border-radius:8px;"
@@ -1011,10 +1003,12 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
             "align-items:center;gap:6px;padding:8px\">'\n"
             "    + '<span style=\"font-size:38px;font-weight:700;"
             "line-height:1\">' + n + '</span>'\n"
-            "    + '<span style=\"color:#888;font-size:13px\">'"
+            "    + '<span style=\"color:#888;font-size:13px\">"
             "个零件待完善编码，点击查看清单</span></a>';\n"
             "}\n")
-        return HttpResponse(js, content_type='application/javascript')
+        resp = HttpResponse(js, content_type='application/javascript')
+        resp['Cache-Control'] = 'no-cache'
+        return resp
 
     @staticmethod
     def _xlsx_response(data, filename):
