@@ -37,6 +37,7 @@ from django.db.models.signals import post_save, pre_save
 
 from plugin import InvenTreePlugin
 from plugin.mixins import (
+    EventMixin, ScheduleMixin, SettingsMixin,
     UrlsMixin, UserInterfaceMixin, ValidationMixin)
 
 logger = logging.getLogger('inventree')
@@ -763,17 +764,130 @@ def on_parameter_save(sender, instance, **kwargs):
 # 插件主体
 # ------------------------------------------------------------------
 
-class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
-                     ValidationMixin, InvenTreePlugin):
-    """微体物料主数据插件：类别/选项自动编号 + IPN 自动生成 + BOM 一键导入。"""
+class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
+                     EventMixin, ScheduleMixin, SettingsMixin,
+                     InvenTreePlugin):
+    """微体物料主数据插件：类别/选项自动编号 + IPN 自动生成 + BOM 一键导入
+    + 订单联动闭环（SO→BO→PO）+ 齐套通知 + 排单优先级。"""
 
     NAME = 'WeiTiMDM'
     SLUG = 'weiti_mdm'
     TITLE = '微体物料主数据'
     DESCRIPTION = ('类别/参数选项自动编号、IPN自动生成({小类码}-{规格段}，'
-                   '无规格件用S流水码)、导入归类兼容、描述反解参数、BOM一键导入')
-    VERSION = '0.2.0'
+                   '无规格件用S流水码)、导入归类兼容、描述反解参数、BOM一键导入、'
+                   '订单联动与齐套通知')
+    VERSION = '1.0.0'
     AUTHOR = '微体科技'
+
+    # ---------------- 插件设置（管理后台→插件→WeiTiMDM→设置） ----------------
+
+    SETTINGS = {
+        'OF_ENABLE': {
+            'name': '启用订单联动',
+            'description': 'SO→BO→PO 缺料自动建单、齐套通知、优先级重算总开关',
+            'validator': bool, 'default': True},
+        'OF_WECOM_WEBHOOK': {
+            'name': '企业微信机器人 Webhook',
+            'description': '群机器人完整 webhook URL，留空则只发站内通知',
+            'default': ''},
+        'OF_BASE_URL': {
+            'name': '站点地址兜底',
+            'description': '通知链接的站点地址，如 http://192.168.1.188:1337；'
+                           '留空则读全局设置 INVENTREE_BASE_URL',
+            'default': ''},
+        'OF_GROUP_PROD': {
+            'name': '生产通知组',
+            'description': '生产订单齐套时通知的 Django 用户组名',
+            'default': '生产'},
+        'OF_GROUP_SALES': {
+            'name': '销售通知组',
+            'description': '销售订单齐套时通知的 Django 用户组名',
+            'default': '销售'},
+        'OF_BUILD_DAYS': {
+            'name': '默认生产周期(天)',
+            'description': 'part.metadata 无 lead_time_days 时的自制周期兜底值',
+            'validator': int, 'default': 7},
+        'OF_PURCHASE_DAYS': {
+            'name': '默认采购周期(天)',
+            'description': 'SupplierPart.metadata 无 lead_time_days 时的采购周期兜底值',
+            'validator': int, 'default': 14},
+        'OF_MAKE_OR_BUY': {
+            'name': '自制/外购兜底',
+            'description': '可自制可外购且交期打平时：build=自制 purchase=外购',
+            'choices': [('build', '自制优先'), ('purchase', '外购优先')],
+            'default': 'purchase'},
+        'OF_PRIO_DUE_W': {
+            'name': '优先级·交期权重',
+            'description': '逾期/临近交期的权重系数',
+            'validator': float, 'default': 1.0},
+        'OF_PRIO_VALUE_W': {
+            'name': '优先级·金额权重',
+            'description': '每万元订单金额的加分(上限30)',
+            'validator': float, 'default': 1.0},
+        'OF_PRIO_INH_W': {
+            'name': '优先级·传导权重',
+            'description': 'BO 继承其来源 SO 紧急度的权重(0~1)',
+            'validator': float, 'default': 0.5},
+    }
+
+    # ---------------- 定时任务（每日重算优先级+齐套） ----------------
+
+    SCHEDULED_TASKS = {
+        'daily_recalc': {'func': 'task_daily_recalc', 'schedule': 'D'},
+    }
+
+    def task_daily_recalc(self, *args, **kwargs):
+        """ScheduleMixin 每日任务入口。"""
+        if not self.get_setting('OF_ENABLE'):
+            return
+        import orderflow
+        orderflow.daily_recalc(self)
+
+    # ---------------- 事件分发（EventMixin） ----------------
+
+    def wants_process_event(self, event):
+        import orderflow
+        return event in orderflow.WATCHED_EVENTS
+
+    def process_event(self, event, *args, **kwargs):
+        """订单/库存事件 → 联动建单 + 齐套重查。"""
+        if not self.get_setting('OF_ENABLE'):
+            return
+        import orderflow
+        from order.models import PurchaseOrder, SalesOrder
+        from build.models import Build
+        pk = kwargs.get('id') or kwargs.get('order_id')
+        try:
+            if event == 'salesorder.issued':
+                so = SalesOrder.objects.get(pk=pk)
+                orderflow.on_sales_order_issued(self, so)
+                orderflow.compute_priorities(self)
+                orderflow.recheck_open_orders(self)
+                orderflow.notify_if_kitted(self, so)
+            elif event == 'build.issued':
+                bo = Build.objects.get(pk=pk)
+                orderflow.on_build_issued(self, bo)
+                orderflow.compute_priorities(self)
+                orderflow.recheck_open_orders(self)
+                orderflow.notify_if_kitted(self, bo)
+            elif event == 'salesorder.cancelled':
+                so = SalesOrder.objects.get(pk=pk)
+                orderflow.cancel_generated_children(so)
+                orderflow.compute_priorities(self)
+            elif event == 'build.cancelled':
+                bo = Build.objects.get(pk=pk)
+                orderflow.cancel_generated_children(bo)
+                orderflow.compute_priorities(self)
+            elif event in ('purchaseorderitem.received',
+                           'stockitem.quantityupdated',
+                           'stockitem.created_items',
+                           'purchaseorder.completed',
+                           'purchaseorder.cancelled',
+                           'purchaseorder.placed',
+                           'build.completed'):
+                orderflow.recheck_open_orders(self)
+        except Exception:
+            logger.exception('WeiTiMDM: 事件 %s 处理失败(pk=%s)', event, pk)
 
     def validate_part_ipn(self, ipn, part):
         """手填 IPN 的格式校验（允许正式码和 ! 临时码）。"""
@@ -803,6 +917,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                  name='supplier-import'),
             path('pending-parts/', self.view_pending_parts,
                  name='pending-parts'),
+            path('schedule/', self.view_schedule_board,
+                 name='schedule-board'),
         ]
 
     # ---------- 零件详情页"BOM导入"按钮（primary_action UI 特性） ----------
@@ -891,6 +1007,13 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
             'icon': 'ti:alert-circle:outline',
             'context': {'url': '/plugin/weiti_mdm/pending-parts/'},
             'source': src,
+        }, {
+            'key': 'weiti-schedule-action',
+            'title': '排单看板',
+            'description': '销售/生产/采购订单按优先级排序',
+            'icon': 'ti:sort-descending:outline',
+            'context': {'url': '/plugin/weiti_mdm/schedule/'},
+            'source': src,
         }]
 
     # ---------- 首页 Dashboard 卡片 ----------
@@ -916,7 +1039,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
             'context': {
                 'bom_url': '/plugin/weiti_mdm/bom-import/',
                 'sup_url': '/plugin/weiti_mdm/supplier-import/',
-                'pending_url': pending_url},
+                'pending_url': pending_url,
+                'sched_url': '/plugin/weiti_mdm/schedule/'},
             'source': f'{src}:renderToolsCard',
         }, {
             'key': 'weiti-pending-count',
@@ -926,7 +1050,39 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
             'options': {'width': 1, 'height': 1},
             'context': {'count': pending, 'pending_url': pending_url},
             'source': f'{src}:renderPendingCard',
+        }, {
+            'key': 'weiti-urgent-orders',
+            'title': '急单提醒',
+            'description': '已逾期或7天内到期的开放订单',
+            'icon': 'ti:alarm:outline',
+            'options': {'width': 1, 'height': 1},
+            'context': {'count': self._urgent_count(),
+                        'sched_url': '/plugin/weiti_mdm/schedule/'},
+            'source': f'{src}:renderUrgentCard',
         }]
+
+    def _urgent_count(self):
+        """逾期或7天内到期的开放订单总数（SO+BO+PO）。"""
+        try:
+            import InvenTree.helpers
+            from datetime import timedelta
+            from order.models import PurchaseOrder, SalesOrder
+            from order.status_codes import (PurchaseOrderStatusGroups,
+                                            SalesOrderStatusGroups)
+            from build.models import Build
+            from build.status_codes import BuildStatusGroups
+            from django.db.models import Q
+            soon = InvenTree.helpers.current_date() + timedelta(days=7)
+            q = Q(target_date__isnull=False) & Q(target_date__lte=soon)
+            n = (SalesOrder.objects.filter(
+                    q, status__in=SalesOrderStatusGroups.OPEN).count()
+                 + Build.objects.filter(
+                    q, status__in=BuildStatusGroups.ACTIVE_CODES).count()
+                 + PurchaseOrder.objects.filter(
+                    q, status__in=PurchaseOrderStatusGroups.OPEN).count())
+            return n
+        except Exception:
+            return 0
 
     # ---------- 待完善 IPN 零件清单页 ----------
 
@@ -951,6 +1107,72 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                 'prog': prog})
         ctx = {'plugin': self, 'parts': rows}
         return self._render(request, 'pending_parts.html', ctx)
+
+    # ---------- 排单看板 ----------
+
+    def view_schedule_board(self, request):
+        """三类开放订单按优先级排序的三栏看板。"""
+        from django.http import HttpResponseForbidden
+        if not (request.user.is_authenticated and request.user.is_staff):
+            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        import orderflow
+        from order.models import PurchaseOrder, SalesOrder
+        from order.status_codes import (PurchaseOrderStatusGroups,
+                                        SalesOrderStatusGroups)
+        from build.models import Build
+        from build.status_codes import BuildStatusGroups
+
+        # POST → 手动触发全量重算
+        if request.method == 'POST':
+            orderflow.daily_recalc(self)
+
+        def prio(o):
+            v = (o.metadata or {}).get(orderflow.META_PRIO)
+            if v is None and hasattr(o, 'priority'):
+                v = o.priority
+            return float(v or 0)
+
+        def kit(o):
+            md = o.metadata or {}
+            return md.get(orderflow.META_KITTED), md.get(orderflow.META_SRC, '')
+
+        today = orderflow._today()
+
+        def pack(objs, purl):
+            out = []
+            for o in objs:
+                k, src = kit(o)
+                out.append({'pk': o.pk, 'ref': o.reference,
+                            'title': str(getattr(o, 'title', '') or ''),
+                            'party': str(getattr(
+                                getattr(o, 'customer', None)
+                                or getattr(o, 'supplier', None)
+                                or getattr(o, 'part', None), 'name',
+                                '') or ''),
+                            'target': o.target_date,
+                            'overdue': bool(o.target_date
+                                            and o.target_date < today),
+                            'prio': prio(o), 'kitted': k, 'src': src,
+                            'url': purl % o.pk})
+            out.sort(key=lambda x: -x['prio'])
+            return out
+
+        ctx = {'plugin': self,
+               'cols': [
+                   ('销售订单', pack(SalesOrder.objects.filter(
+                       status__in=SalesOrderStatusGroups.OPEN),
+                       '/web/sales/sales-order/%s/')),
+                   ('生产订单', pack(Build.objects.filter(
+                       status__in=BuildStatusGroups.ACTIVE_CODES)
+                       .select_related('part'),
+                       '/web/manufacturing/build-order/%s/')),
+                   ('采购订单', pack(PurchaseOrder.objects.filter(
+                       status__in=PurchaseOrderStatusGroups.OPEN)
+                       .select_related('supplier'),
+                       '/web/purchasing/purchase-order/%s/')),
+               ],
+               'recalc': request.method == 'POST'}
+        return self._render(request, 'schedule_board.html', ctx)
 
     def view_bom_js(self, request):
         """全部 UI 特性的 JS（单一模块，已被按钮链路验证可加载）。
@@ -991,7 +1213,22 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
             "        '零件关联供应商 / 制造商 / SKU / 价格')\n"
             "    + linkBtn(c.pending_url, '待完善编码',\n"
             "        'IPN 以 ! 开头的零件清单')\n"
+            "    + linkBtn(c.sched_url, '排单看板',\n"
+            "        '销售/生产/采购订单优先级排序')\n"
             "    + '</div>';\n"
+            "}\n"
+            "export function renderUrgentCard(target, ctx) {\n"
+            "  if (!target) { return; }\n"
+            "  var c = (ctx && ctx.context) || {};\n"
+            "  var n = (c.count == null) ? '?' : c.count;\n"
+            "  target.innerHTML ="
+            " '<a href=\"' + c.sched_url + '\" style=\"text-decoration:none;"
+            "color:inherit;display:flex;flex-direction:column;align-items:center;"
+            "gap:6px;padding:8px\">'\n"
+            "    + '<span style=\"font-size:38px;font-weight:700;line-height:1;"
+            "color:#e8590c\">' + n + '</span>'\n"
+            "    + '<span style=\"color:#888;font-size:13px\">"
+            "个订单逾期或一周内到期，点击查看排单</span></a>';\n"
             "}\n"
             "export function renderPendingCard(target, ctx) {\n"
             "  if (!target) { return; }\n"
@@ -1639,6 +1876,52 @@ _signals_connected = False
 _signals_attempted = False
 
 
+def _defer_ordercheck(task_path, obj_pk):
+    """事务提交后把检查任务投给 worker（保证相关行已落库）。
+
+    offload_task 默认 check_duplicates=True，同一次批量建行项目
+    产生的多个相同任务会被合并为一个。
+    """
+    if not obj_pk:
+        return
+    from django.db import transaction
+    from InvenTree.ready import isImportingData, isRebuildingData
+    if isImportingData() or isRebuildingData():
+        return
+
+    def _go(t=task_path, i=obj_pk):
+        try:
+            from InvenTree.tasks import offload_task
+            offload_task(t, i)
+        except Exception:
+            logger.exception('WeiTiMDM: 投递订单检查任务失败')
+    transaction.on_commit(_go)
+
+
+def on_order_line_save(sender, instance, **kwargs):
+    """订单行项目保存（含新建/改数量）→ 异步缺口检查。"""
+    try:
+        cls_name = instance.__class__.__name__
+        if cls_name == 'SalesOrderLineItem':
+            _defer_ordercheck('orderflow.task_check_sales_order',
+                              instance.order_id)
+        elif cls_name == 'BuildLine':
+            _defer_ordercheck('orderflow.task_check_build',
+                              instance.build_id)
+    except Exception:
+        logger.exception('WeiTiMDM: 订单行信号处理失败')
+
+
+def on_build_save(sender, instance, created, **kwargs):
+    """新 BO 建立即检查（行项目可能尚未生成——BuildLine 信号兜底）。"""
+    if not created:
+        return
+    try:
+        _defer_ordercheck('orderflow.task_check_build', instance.pk)
+    except Exception:
+        logger.exception('WeiTiMDM: 生产单信号处理失败')
+
+
 def _connect_signals():
     """各信号独立挂载，单个失败不拖垮整体。"""
     global _signals_connected
@@ -1681,6 +1964,20 @@ def _connect_signals():
     except Exception:
         ok = False
         logger.exception('WeiTiMDM: 参数模板信号挂载失败(不影响其他功能)')
+
+    # 订单联动信号：行项目保存即查缺料（不等到单下达）
+    try:
+        from order.models import SalesOrderLineItem
+        from build.models import Build, BuildLine
+        post_save.connect(on_order_line_save, sender=SalesOrderLineItem,
+                          dispatch_uid='weiti_mdm_so_line')
+        post_save.connect(on_order_line_save, sender=BuildLine,
+                          dispatch_uid='weiti_mdm_build_line')
+        post_save.connect(on_build_save, sender=Build,
+                          dispatch_uid='weiti_mdm_build_new')
+    except Exception:
+        ok = False
+        logger.exception('WeiTiMDM: 订单联动信号挂载失败')
 
     _signals_connected = ok
     if ok:

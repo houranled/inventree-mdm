@@ -231,6 +231,57 @@ sudo docker exec -it inventree-server \
 - 类别名不带码前缀（如「结构类」而非「2-结构类」）时，其下小类无法自动编号；
 - 已有合规 IPN 的零件不会被改写，可反复执行。
 
+### 订单联动闭环（SO→BO→PO）+ 齐套通知 + 排单
+
+标准 MRP 方向：销售订单是需求源头，向下传导。
+
+```
+SO 建行项目(post_save)   → 逐行查缺口(quantity − shipped − allocated
+   ├─ 可自制 → 自动生成 PENDING 生产单（sales_order 字段回链来源）   − 可用 − 在产 − 在途)
+   └─ 可外购 → 按供应商分组自动生成 PENDING 采购单
+BO 建立/行保存           → BOM 行缺料：外购件挂 PO 行；
+                            装配件由原生 Auto Create Builds 建子 BO
+                            （该插件未启用时本插件兜底，挂 parent 父子关系）
+SO/BO 取消               → 自动取消其下游仍为 PENDING 的生成单
+PO 到货 / 库存变动        → 未齐套订单自动重查
+```
+
+触发时机说明：**行项目保存（含新建）即触发**，不需要等订单下达；
+下游单全部生成为 `PENDING` 待审态，需人工下达。缺口按净额计算
+（扣在产、在途），行项目改数量后自动补差，重复触发不重复建单。
+信号经 `transaction.on_commit + offload_task` 投递给后台 worker 执行。
+
+- **自制/外购判定**：只能走一种的直接走；两者皆可时比交期——
+  `part.metadata['lead_time_days']`（自制周期）vs
+  `SupplierPart.metadata['lead_time_days']`（取最小供应商交期），
+  没数据用插件设置的默认天数，打平按「自制/外购兜底」设置。
+- **齐套口径**：`part.available_stock ≥ 尚未分配的需求`（"库存够发"，
+  不要求先做分配动作）。标记写 `order.metadata`：
+  `weiti_kitted` / `weiti_shortages`（缺料明细）。
+- **齐套通知**：只在 不齐套→齐套 跳变时发——站内通知铃 +
+  企微群机器人 webhook（markdown 消息带订单链接）。
+  收件人 = 插件设置里的生产组/销售组（Django Group）全员 +
+  订单 `responsible` 负责人。
+- **排单**：`priority = 交期得分×权重 + 金额得分 + 上游传导`。
+  生产单写原生 `priority` 字段，销售/采购单写 `metadata['weiti_priority']`。
+  看板页 `/plugin/weiti_mdm/schedule/`（Ctrl+K 搜「排单看板」，
+  或仪表盘「急单提醒」卡片），页面有「重算优先级」按钮；
+  另有每日定时任务全量兜底。
+
+**插件设置**（管理员中心 → 插件 → WeiTiMDM → 设置）：
+
+| 键 | 说明 | 默认 |
+|---|---|---|
+| `OF_ENABLE` | 联动总开关 | 开 |
+| `OF_WECOM_WEBHOOK` | 企微机器人完整 URL（空=只发站内） | 空 |
+| `OF_GROUP_PROD` / `OF_GROUP_SALES` | 生产/销售通知组名 | 生产 / 销售 |
+| `OF_BUILD_DAYS` / `OF_PURCHASE_DAYS` | 默认生产/采购周期 | 7 / 14 天 |
+| `OF_MAKE_OR_BUY` | 交期打平兜底 | 外购 |
+| `OF_PRIO_*_W` | 优先级三项权重 | 1.0 / 1.0 / 0.5 |
+
+> 依赖插件文件：`orderflow.py`、`weiti_notify.py`、`templates/schedule_board.html`。
+> 定时任务需系统设置开启 `ENABLE_PLUGINS_SCHEDULE`。
+
 ## 七、用户组权限建议（分组角色）
 
 管理员中心 → 用户 → 用户组 → 「分组角色」，按 视图/更改/添加/删除 四列勾选。
