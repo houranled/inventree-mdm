@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>订单穿透 — {{ order.reference }}</title>
+  <style>
+    body { font-family: system-ui, "Microsoft YaHei", sans-serif;
+           max-width: 900px; margin: 32px auto; padding: 0 16px;
+           color: #222; }
+    h1 { font-size: 20px; }
+    .hint { color: #888; font-size: 13px; }
+    .tree { margin-top: 16px; font-size: 14px; }
+    .node { padding: 8px 10px; border-left: 3px solid #dee2e6;
+            margin: 6px 0; background: #fafbfc; }
+    .node.d0 { border-left-color: #1971c2; }
+    .d1 { margin-left: 1.5em; }  .d2 { margin-left: 3em; }
+    .d3 { margin-left: 4.5em; }  .d4 { margin-left: 6em; }
+    .d5 { margin-left: 7.5em; }  .d6 { margin-left: 9em; }
+    .d7 { margin-left: 10.5em; } .d8 { margin-left: 12em; }
+    .node .k { font-size: 12px; color: #fff; border-radius: 3px;
+               padding: 1px 6px; margin-right: 8px; }
+    .k-salesorder { background: #1971c2; }
+    .k-build { background: #e8590c; }
+    .k-purchaseorder { background: #2f9e44; }
+    .k-part { background: #6741d9; }
+    a.plain { color: #2f6feb; text-decoration: none;
+              font-weight: 600; }
+    .status { color: #666; font-size: 12px; margin-left: 8px; }
+    .kit-ok { color: #2b8a3e; font-size: 12px; margin-left: 8px; }
+    .kit-no { color: #b3261e; font-size: 12px; margin-left: 8px; }
+  </style>
+</head>
+<body>
+  <h1>订单穿透 — {{ order.reference }}</h1>
+  <p class="hint">需求传导链：销售订单 → 生产订单 → 采购订单。
+    蓝=销售单，橙=生产单，绿=采购单。</p>
+
+  {% if rows %}
+  <div class="tree">
+    {% for r in rows %}
+    <div class="node d{{ r.d }}">
+      <span class="k k-{{ r.kind|lower }}">{{ r.label }}</span>
+      <a class="plain" href="{{ r.url }}">{{ r.ref }}</a>
+      <span class="status">{{ r.status }}</span>
+      {% if r.kitted == True %}<span class="kit-ok">✓ 已齐套</span>
+      {% elif r.kitted == False %}<span class="kit-no">✗ 缺料</span>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+    <p class="hint" style="margin-top:16px">没有关联的下游订单。</p>
+  {% endif %}
+
+  <p style="margin-top:20px">
+    <a class="plain" href="{{ rows.0.url }}">打开订单 →</a> ·
+    <a class="plain" href="/plugin/weiti_mdm/schedule/">排单看板</a>
+  </p>
+</body>
+</html>

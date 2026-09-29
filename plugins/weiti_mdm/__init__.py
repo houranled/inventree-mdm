@@ -923,6 +923,10 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                  name='part-po'),
             path('part-table/<int:pk>/', self.view_part_table,
                  name='part-table'),
+            path('shortages/', self.view_shortages,
+                 name='shortages'),
+            path('trace/<str:kind>/<int:pk>/', self.view_trace,
+                 name='trace'),
         ]
 
     # ---------- 零件详情页"BOM导入"按钮（primary_action UI 特性） ----------
@@ -934,25 +938,45 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
         零件详情页形如 /web/part/42/ —— 从中抠出 pk。
         context 是 QueryDict，取不到/不匹配就返回空（不出按钮）。
         """
+        # 订单详情页 → "订单穿透"按钮
+        mo = re.search(r'/(sales-order|build-order|purchase-order)/(\d+)',
+                       str(context.get('location', '')))
+        if mo:
+            kmap = {'sales-order': 'salesorder',
+                    'build-order': 'build',
+                    'purchase-order': 'purchaseorder'}
+            return [{
+                'key': 'weiti-order-trace',
+                'title': '订单穿透',
+                'icon': 'ti:binary-tree:outline',
+                'options': {'color': 'violet'},
+                'context': {'url': '/plugin/weiti_mdm/trace/%s/%s/' % (
+                    kmap[mo.group(1)], mo.group(2))},
+                'source': '/plugin/weiti_mdm/bom-import.js',
+            }]
         m = re.search(r'/part/(\d+)', str(context.get('location', '')))
         if not m:
             return []
         pk = m.group(1)
-        actions = [{
-            'key': 'weiti-bom-import',
-            'title': 'BOM导入',
-            'icon': 'ti:list-plus:outline',
-            'options': {'color': 'teal'},
-            'context': {'url': f'/plugin/weiti_mdm/bom-import/?parent={pk}'},
-            'source': '/plugin/weiti_mdm/bom-import.js',
-        }]
-        # 有 BOM 行的零件才出"导出BOM"按钮
+        # 一次查询拿两个标志：组装零件才有 BOM 概念
         try:
             from part.models import Part
-            has_bom = Part.objects.filter(
-                pk=pk, bom_items__isnull=False).exists()
+            part = Part.objects.get(pk=pk)
+            is_assembly = bool(part.assembly)
+            has_bom = part.bom_items.exists()
         except Exception:
-            has_bom = True
+            is_assembly, has_bom = True, True
+        actions = []
+        if is_assembly:
+            actions.append({
+                'key': 'weiti-bom-import',
+                'title': 'BOM导入',
+                'icon': 'ti:list-plus:outline',
+                'options': {'color': 'teal'},
+                'context': {'url': f'/plugin/weiti_mdm/'
+                                   f'bom-import/?parent={pk}'},
+                'source': '/plugin/weiti_mdm/bom-import.js',
+            })
         if has_bom:
             actions.append({
                 'key': 'weiti-bom-export',
@@ -1034,6 +1058,13 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             'icon': 'ti:sort-descending:outline',
             'context': {'url': '/plugin/weiti_mdm/schedule/'},
             'source': src,
+        }, {
+            'key': 'weiti-shortages-action',
+            'title': '缺料总览',
+            'description': '所有开放订单的缺料聚合清单',
+            'icon': 'ti:clipboard-x:outline',
+            'context': {'url': '/plugin/weiti_mdm/shortages/'},
+            'source': src,
         }]
 
     # ---------- 订单详情页"关联订单"面板 ----------
@@ -1059,71 +1090,85 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
         panels = []
         try:
             if model in ('build', 'salesorder'):
-                # 正向：该订单自动生成了哪些 PO
+                # 正向：该订单（含其子树）自动生成了哪些 PO
+                from django.db.models import Q
                 from order.models import PurchaseOrder
                 kind = {'build': 'Build', 'salesorder': 'SalesOrder'}[model]
-                pos = PurchaseOrder.objects.filter(
-                    metadata__weiti_source='%s:%s' % (kind, pk))
+                tag = '%s:%s' % (kind, pk)
+                q = (Q(metadata__weiti_source=tag)
+                     | Q(metadata__weiti_root=tag))
+                if kind == 'Build':
+                    try:
+                        from build.models import Build
+                        bo = Build.objects.get(pk=pk)
+                        sub_tags = ['Build:%s' % b.pk for b in
+                                    bo.get_descendants(include_self=True)]
+                        q |= Q(metadata__weiti_source__in=sub_tags)
+                    except Exception:
+                        pass
+                pos = PurchaseOrder.objects.filter(q).distinct()
                 orders = [
                     {'pk': p.pk, 'ref': p.reference,
-                     'extra': str(p.supplier.name) if p.supplier else ''}
+                     'extra': str(p.supplier.name) if p.supplier else '',
+                     'url': '/web/purchasing/purchase-order/%s/' % p.pk}
                     for p in pos.select_related('supplier')]
                 if orders:
                     panels.append({
                         'key': 'weiti-linked-pos',
                         'title': '关联采购单',
                         'icon': 'ti:building-store:outline',
-                        'context': {'kind': 'po', 'orders': orders},
+                        'context': {'orders': orders},
                         'source': src})
             elif model == 'purchaseorder':
-                # 反向：这张 PO 是为哪张单生成的
+                # 反向：直接来源 + 最上游归属（不同才显示两级）
+                import orderflow
                 from order.models import PurchaseOrder
                 po = PurchaseOrder.objects.get(pk=pk)
-                src_tag = (po.metadata or {}).get('weiti_source', '')
-                if ':' in src_tag:
-                    kind, src_pk = src_tag.split(':', 1)
-                    ui_kind = {'Build': 'build',
-                               'SalesOrder': 'salesorder',
-                               'Part': 'part'}.get(kind)
-                    if ui_kind:
-                        ref = src_tag
-                        try:
-                            # 取来源对象的真实单号/编码显示
-                            if kind == 'Part':
-                                from part.models import Part
-                                ref = (Part.objects.get(pk=src_pk).IPN
-                                       or src_tag)
-                            elif kind == 'Build':
-                                from build.models import Build
-                                ref = Build.objects.get(pk=src_pk).reference
-                            elif kind == 'SalesOrder':
-                                from order.models import SalesOrder
-                                ref = SalesOrder.objects.get(
-                                    pk=src_pk).reference
-                        except Exception:
-                            pass
-                        panels.append({
-                            'key': 'weiti-source-order',
-                            'title': '来源订单',
-                            'icon': 'ti:link:outline',
-                            'context': {'kind': ui_kind, 'orders': [
-                                {'pk': src_pk, 'ref': ref, 'extra': ''}]},
-                            'source': src})
+                md = po.metadata or {}
+                orders = []
+                seen_tags = set()
+                for key, badge in (('weiti_source', '直接来源'),
+                                   ('weiti_root', '最上游归属')):
+                    tag = md.get(key, '')
+                    if ':' not in tag or tag in seen_tags:
+                        continue
+                    seen_tags.add(tag)
+                    kind, src_pk = tag.split(':', 1)
+                    url_tpl = orderflow._SRC_URLS.get(kind)
+                    if not url_tpl:
+                        continue
+                    src_obj = orderflow._resolve_tag(tag)
+                    orders.append({
+                        'pk': src_pk,
+                        'ref': (orderflow._src_ref(src_obj)
+                                if src_obj else tag),
+                        'extra': badge,
+                        'url': url_tpl % src_pk})
+                if orders:
+                    panels.append({
+                        'key': 'weiti-source-order',
+                        'title': '来源订单',
+                        'icon': 'ti:link:outline',
+                        'context': {'orders': orders},
+                        'source': src})
             elif model == 'part':
                 # 零件页反向：哪些 PO 是从该零件"按BOM采购"生成的
+                from django.db.models import Q
                 from order.models import PurchaseOrder
                 pos = PurchaseOrder.objects.filter(
-                    metadata__weiti_source='Part:%s' % pk)
+                    Q(metadata__weiti_source='Part:%s' % pk)
+                    | Q(metadata__weiti_root='Part:%s' % pk))
                 orders = [
                     {'pk': p.pk, 'ref': p.reference,
-                     'extra': str(p.supplier.name) if p.supplier else ''}
+                     'extra': str(p.supplier.name) if p.supplier else '',
+                     'url': '/web/purchasing/purchase-order/%s/' % p.pk}
                     for p in pos.select_related('supplier')]
                 if orders:
                     panels.append({
                         'key': 'weiti-linked-pos',
                         'title': '关联采购单',
                         'icon': 'ti:building-store:outline',
-                        'context': {'kind': 'po', 'orders': orders},
+                        'context': {'orders': orders},
                         'source': src})
                 # 物料总表：摊平到叶子件的简表面板
                 from part.models import Part
@@ -1178,7 +1223,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                 'bom_url': '/plugin/weiti_mdm/bom-import/',
                 'sup_url': '/plugin/weiti_mdm/supplier-import/',
                 'pending_url': pending_url,
-                'sched_url': '/plugin/weiti_mdm/schedule/'},
+                'sched_url': '/plugin/weiti_mdm/schedule/',
+                'short_url': '/plugin/weiti_mdm/shortages/'},
             'source': f'{src}:renderToolsCard',
         }, {
             'key': 'weiti-pending-count',
@@ -1333,14 +1379,23 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
         rows = []
         for e in orderflow.collect_bom_leaves(part, qty):
             p, need = e['part'], e['need']
-            # 规格参数拼接（类别模板的键值对）
+            # 规格参数拼接；材质/工艺类字段拆成独立列
+            spec_parts, material, process = [], [], []
             try:
-                spec = '；'.join(
-                    '%s=%s' % (x.template.name, str(x.data).strip())
-                    for x in p.parameters.select_related('template').all()
-                    if str(x.data or '').strip())
+                for x in p.parameters.select_related('template').all():
+                    v = str(x.data or '').strip()
+                    if not v:
+                        continue
+                    name = x.template.name
+                    if '材质' in name:
+                        material.append(v)
+                    elif '工艺' in name or '表面' in name:
+                        process.append(v)
+                    else:
+                        spec_parts.append('%s=%s' % (name, v))
             except Exception:
-                spec = ''
+                pass
+            spec = '；'.join(spec_parts)
             # 供应商：按需求数量取最低价（复用采购行逻辑）
             sp = orderflow._pick_supplier_part(p, need)
             price, lead = None, ''
@@ -1363,8 +1418,12 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             on_order = getattr(p, 'on_order', 0) or 0
             building = getattr(p, 'quantity_being_built', 0) or 0
             gap = orderflow._uncovered(p, need)
+            unit = (e['need'] / qty) if qty else e['need']
             rows.append({
-                'part': p, 'need': need, 'spec': spec,
+                'part': p, 'qty': unit, 'need': need, 'spec': spec,
+                'material': '；'.join(material),
+                'process': '；'.join(process),
+                'usage': e.get('usage', ''),
                 'img': p.image.url if p.image else '',
                 'stock': stock, 'on_order': on_order,
                 'building': building, 'gap': gap,
@@ -1381,6 +1440,38 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                     or getattr(a, 'link', None)]})
         ctx = {'part': part, 'qty': qty, 'rows': rows}
         return self._render(request, 'part_table.html', ctx)
+
+    # ---------- 缺料总览 / 订单穿透 ----------
+
+    def view_shortages(self, request):
+        """缺料总览：所有开放订单的需求按零件聚合，谁缺、谁等、谁补。"""
+        from django.http import HttpResponseForbidden
+        if not (request.user.is_authenticated and request.user.is_staff):
+            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        import orderflow
+        rows = orderflow.collect_shortages()
+        ctx = {'rows': rows}
+        return self._render(request, 'shortages.html', ctx)
+
+    def view_trace(self, request, kind, pk):
+        """订单穿透树：SO→BO→PO 全链条状态。"""
+        from django.http import HttpResponse, HttpResponseForbidden
+        if not (request.user.is_authenticated and request.user.is_staff):
+            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        from build.models import Build
+        from order.models import PurchaseOrder, SalesOrder
+        cls = {'salesorder': SalesOrder, 'build': Build,
+               'purchaseorder': PurchaseOrder}.get(kind)
+        if cls is None:
+            return HttpResponse('不支持的订单类型', status=404)
+        try:
+            order = cls.objects.get(pk=pk)
+        except cls.DoesNotExist:
+            return HttpResponse('订单不存在', status=404)
+        import orderflow
+        ctx = {'order': order, 'kind': kind,
+               'rows': orderflow.order_trace(order)}
+        return self._render(request, 'trace.html', ctx)
 
     # ---------- 排单看板 ----------
 
@@ -1489,6 +1580,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             "        'IPN 以 ! 开头的零件清单')\n"
             "    + linkBtn(c.sched_url, '排单看板',\n"
             "        '销售/生产/采购订单优先级排序')\n"
+            "    + linkBtn(c.short_url, '缺料总览',\n"
+            "        '开放订单缺料聚合清单')\n"
             "    + '</div>';\n"
             "}\n"
             "export function renderUrgentCard(target, ctx) {\n"
@@ -1526,6 +1619,9 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             "    salesorder:'/web/sales/sales-order/',\n"
             "    part:'/web/part/'};\n"
             "  var base = paths[c.kind] || '/web/';\n"
+            "  var href = function (o) {\n"
+            "    return o.url || (base + o.pk + '/');\n"
+            "  };\n"
             "  if (!orders.length) {\n"
             "    target.innerHTML = '<div style=\"color:#888\">暂无</div>';\n"
             "    return;\n"
@@ -1538,7 +1634,7 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             "      .replace(/&/g,'&amp;').replace(/</g,'&lt;');\n"
             "    var extra = String(o.extra || '')\n"
             "      .replace(/&/g,'&amp;').replace(/</g,'&lt;');\n"
-            "    html += '<a href=\"' + base + o.pk + '/\" "
+            "    html += '<a href=\"' + href(o) + '\" "
             "style=\"display:block;padding:8px 12px;"
             "border:1px solid #dee2e6;border-radius:8px;"
             "text-decoration:none;color:inherit\">'\n"
@@ -1569,7 +1665,7 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             "width:100%\">'\n"
             "    + '<tr><th style=\"' + th + '\">IPN</th>'\n"
             "    + '<th style=\"' + th + '\">名称</th>'\n"
-            "    + '<th style=\"' + th + '\">需求</th>'\n"
+            "    + '<th style=\"' + th + '\">单套需求</th>'\n"
             "    + '<th style=\"' + th + '\">库存</th>'\n"
             "    + '<th style=\"' + th + '\">在途</th>'\n"
             "    + '<th style=\"' + th + '\">缺口</th></tr>';\n"

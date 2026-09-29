@@ -31,7 +31,7 @@
 <body>
   <h1>物料明细总表 — {{ part.IPN }} {{ part.name }}</h1>
   <p class="hint">摊平到最底层叶子件（半成品子装配继续下钻）。
-    缺口 = 需求 − 库存 − 在产 − 在途。红色行 = 有净缺口。</p>
+    需求合计 = 单套需求 × 套数。缺口 = 需求合计 − 库存 − 在产 − 在途。红色行 = 有净缺口。</p>
 
   <form method="get">
     套数：<input type="number" name="qty" min="1" step="1"
@@ -43,12 +43,13 @@
   <table>
     <tr>
       <th>#</th><th>图片</th><th>IPN</th><th>名称</th><th>类别</th>
-      <th>规格参数</th><th>单位</th><th class="num">单套需求</th>
-      <th class="num">库存</th><th class="num">在途</th>
+      <th>规格参数</th><th>材质</th><th>工艺</th><th>用途/位号</th>
+      <th>单位</th><th class="num">单套需求</th>
+      <th class="num">需求合计</th><th class="num"></th>库存</th><th class="num">在途</th>
       <th class="num">在产</th><th class="num">缺口</th>
       <th>外购</th><th>供应商</th><th>SKU</th>
       <th class="num">参考单价</th><th class="num">采购周期</th>
-      <th>附件</th>
+      <th>备注</th><th>附件</th>
     </tr>
     {% for r in rows %}
     <tr{% if r.gap > 0 %} class="short"{% endif %}>
@@ -59,15 +60,24 @@
           href="/web/part/{{ r.part.pk }}/">{{ r.part.name }}</a></td>
       <td>{{ r.part.category.name|default:"—" }}</td>
       <td class="spec">{{ r.spec|default:"—" }}</td>
+      <td>{{ r.material|default:"—" }}</td>
+      <td>{{ r.process|default:"—" }}</td>
+      <td class="spec">{{ r.usage|default:"—" }}</td>
       <td>{{ r.part.units|default:"—" }}</td>
-      <td class="num">{{ r.need|floatformat:"-2" }}</td>
+      <td class="num">{{ r.qty|floatformat:"-2" }}</td>
+      <td class="num"><b>{{ r.need|floatformat:"-2" }}</b></td>
       <td class="num">{{ r.stock|floatformat:"-2" }}</td>
       <td class="num">
-        {{ r.on_order|floatformat:"-2" }}
-        {% for pk, ref in r.pos %}
+        {% if r.pos|length == 1 %}{% for pk, ref in r.pos %}
           <a class="plain"
-            href="/web/purchasing/purchase-order/{{ pk }}/">{{ ref }}</a>
-        {% endfor %}
+            href="/web/purchasing/purchase-order/{{ pk }}/">{{ r.on_order|floatformat:"-2" }} ↗</a>
+        {% endfor %}{% else %}
+          {{ r.on_order|floatformat:"-2" }}
+          {% for pk, ref in r.pos %}
+            <a class="plain"
+              href="/web/purchasing/purchase-order/{{ pk }}/">{{ ref }}</a>
+          {% endfor %}
+        {% endif %}
       </td>
       <td class="num">
         {{ r.building|floatformat:"-2" }}
@@ -85,6 +95,7 @@
       <td>{{ r.sku }}</td>
       <td class="num">{% if r.price %}{{ r.price }}{% else %}—{% endif %}</td>
       <td class="num">{{ r.lead|default:"—" }}{% if r.lead %} 天{% endif %}</td>
+      <td class="spec">{{ r.part.description|default:"—" }}</td>
       <td>
         {% for a in r.attachments %}
           <a class="plain" href="{{ a.url }}" target="_blank">{{ a.name }}</a>

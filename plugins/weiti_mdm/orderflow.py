@@ -25,10 +25,12 @@ META_KITTED = 'weiti_kitted'
 META_SHORT = 'weiti_shortages'
 META_PRIO = 'weiti_priority'
 META_SRC = 'weiti_source'
+META_ROOT = 'weiti_root'
 
 # 来源对象的 PUI 详情页路径（相对路径，写入 PO.link 后可点击跳回）
 _SRC_URLS = {'Build': '/web/manufacturing/build-order/%s/',
              'SalesOrder': '/web/sales/sales-order/%s/',
+             'PurchaseOrder': '/web/purchasing/purchase-order/%s/',
              'Part': '/web/part/%s/'}
 
 
@@ -36,6 +38,44 @@ def _src_ref(obj):
     """来源显示名：订单用 reference，零件用 IPN/名称。"""
     return (getattr(obj, 'reference', None)
             or getattr(obj, 'IPN', None) or str(obj))
+
+
+def _src_tag(obj):
+    """来源标签：'SalesOrder:12' 形式，写入 metadata 溯源。"""
+    return '%s:%s' % (obj.__class__.__name__, obj.pk)
+
+
+def _root_source(order):
+    """最上游归属：沿 Build.parent 爬到顶；顶层 BO 有 sales_order 则根=SO。"""
+    node, seen = order, {order.pk}
+    while (node.__class__.__name__ == 'Build'
+           and node.parent_id and node.parent_id not in seen):
+        seen.add(node.parent_id)
+        node = node.parent
+    if node.__class__.__name__ == 'Build' and node.sales_order_id:
+        return node.sales_order
+    return node
+
+
+def _resolve_tag(tag):
+    """'SalesOrder:12' → 对象；不存在返回 None。"""
+    try:
+        kind, pk = str(tag).split(':', 1)
+        if kind == 'SalesOrder':
+            from order.models import SalesOrder
+            return SalesOrder.objects.get(pk=pk)
+        if kind == 'Build':
+            from build.models import Build
+            return Build.objects.get(pk=pk)
+        if kind == 'PurchaseOrder':
+            from order.models import PurchaseOrder
+            return PurchaseOrder.objects.get(pk=pk)
+        if kind == 'Part':
+            from part.models import Part
+            return Part.objects.get(pk=pk)
+    except Exception:
+        pass
+    return None
 
 WATCHED_EVENTS = frozenset([
     'salesorder.issued',
@@ -310,8 +350,8 @@ def _create_build(part, qty, source_order, need_by):
         start_date=_today(),
         target_date=need_by,
         status=BuildStatus.PENDING,
-        metadata={META_SRC: '%s:%s' % (
-            source_order.__class__.__name__, source_order.pk)})
+        metadata={META_SRC: _src_tag(source_order),
+                  META_ROOT: _src_tag(_root_source(source_order))})
 
 
 def _create_po_lines(plugin, items, source_order, need_by):
@@ -346,7 +386,8 @@ def _create_po_lines(plugin, items, source_order, need_by):
             responsible=_responsible_of(source_order),
             target_date=need_by,
             project_code=getattr(source_order, 'project_code', None),
-            metadata={META_SRC: '%s:%s' % (src_kind, source_order.pk)})
+            metadata={META_SRC: '%s:%s' % (src_kind, source_order.pk),
+                      META_ROOT: _src_tag(_root_source(source_order))})
         for sp, part, qty, price in g['lines']:
             PurchaseOrderLineItem.objects.create(
                 order=po, part=sp, quantity=qty,
@@ -461,9 +502,12 @@ def cancel_generated_children(source):
         logger.info('WeiTiMDM: 随 %s 取消自动取消生产单 %s',
                     source.reference, b.reference)
 
+    # 直接来源或被标记为最上游归属的 PENDING PO 一并取消
+    from django.db.models import Q
     pos = PurchaseOrder.objects.filter(
-        metadata__weiti_source=src_tag,
-        status=PurchaseOrderStatus.PENDING.value)
+        Q(metadata__weiti_source=src_tag)
+        | Q(metadata__weiti_root=src_tag),
+        status=PurchaseOrderStatus.PENDING.value).distinct()
     for po in pos:
         try:
             po.cancel_order()
@@ -535,9 +579,11 @@ def compute_priorities(plugin):
             status__in=BuildStatusGroups.ACTIVE_CODES):
         own = _due_score(bo.target_date, today) * due_w
         inh = 0.0
-        so = getattr(bo, 'sales_order', None)
-        if so is not None:
-            inh = _due_score(so.target_date, today) * due_w * inh_w
+        # 最上游归属（SO 优先，其次顶层 BO）的交期传导
+        root = _root_source(bo)
+        if root is not bo:
+            inh = _due_score(getattr(root, 'target_date', None),
+                             today) * due_w * inh_w
         score = own + inh + value_pts(bo)
         if bo.priority != int(round(score)):
             bo.priority = max(0, int(round(score)))
@@ -556,6 +602,11 @@ def compute_priorities(plugin):
         dates = [d for d in dates if d]
         earliest = min(dates) if dates else None
         score = _due_score(earliest, today) * due_w + value_pts(po)
+        # 最上游归属订单的交期传导
+        root = _resolve_tag((po.metadata or {}).get(META_ROOT, ''))
+        if root is not None:
+            score += _due_score(getattr(root, 'target_date', None),
+                                today) * due_w * inh_w
         md = _meta(po)
         md[META_PRIO] = round(score, 1)
         po.metadata = md
@@ -677,11 +728,20 @@ def collect_bom_leaves(part, qty):
             if sub.bom_items.exists():
                 walk(sub, need, path | {sub.pk})
             else:
-                agg.setdefault(
-                    sub.pk, {'part': sub, 'need': Decimal(0)}
-                )['need'] += need
+                e = agg.setdefault(
+                    sub.pk, {'part': sub, 'need': Decimal(0),
+                             'notes': set(), 'refs': set()})
+                e['need'] += need
+                # BOM 行语义：note/参考位号 表达"用在哪、哪几颗"
+                if getattr(it, 'note', None):
+                    e['notes'].add(str(it.note).strip())
+                if getattr(it, 'reference', None):
+                    e['refs'].add(str(it.reference).strip())
 
     walk(part, Decimal(str(qty)), {part.pk})
+    for e in agg.values():
+        e['usage'] = '；'.join(sorted(x for x in
+                                    (e['notes'] | e['refs']) if x))
     return list(agg.values())
 
 
@@ -738,3 +798,142 @@ def collect_bom_purchasables(part, qty):
 def create_pos_for_part(plugin, items, part, need_by=None):
     """零件级"按BOM采购"入口：source 为 Part，复用 _create_po_lines。"""
     return _create_po_lines(plugin, items, part, need_by or _today())
+
+
+# ------------------------------------------------------------------
+# 缺料总览 / 订单穿透
+# ------------------------------------------------------------------
+
+def collect_shortages():
+    """聚合所有开放订单的零件需求缺口（采购员视角的缺料总览）。
+
+    需求来源：开放 SO 行未分配量 + 开放 BO 行未分配量。
+    返回 [{'part','need','gap','demands':[{kind,pk,ref,qty,date}],
+           'stock','on_order','building','pos','bos'}]
+    按最早需求日排序，只返回有需求或有缺口的零件。
+    """
+    from order.models import PurchaseOrderLineItem, SalesOrder
+    from order.status_codes import (PurchaseOrderStatusGroups,
+                                    SalesOrderStatusGroups)
+    from build.models import Build, BuildLine
+    from build.status_codes import BuildStatusGroups
+
+    agg = {}  # part_pk -> entry
+
+    def demand(part, qty, kind, pk, ref, date, root=None):
+        if qty <= 0:
+            return
+        e = agg.setdefault(part.pk, {
+            'part': part, 'need': Decimal(0), 'demands': []})
+        e['need'] += qty
+        d = {'kind': kind, 'pk': pk, 'ref': ref, 'qty': qty, 'date': date,
+             'url': _SRC_URLS.get(kind, '') % pk if kind in _SRC_URLS else ''}
+        # 需求的最上游归属（如 BO 需求归属 SO-0012），与直接来源相同则不标
+        if (root is not None
+                and (root.__class__.__name__, root.pk) != (kind, pk)):
+            rk = root.__class__.__name__
+            d['root_ref'] = _src_ref(root)
+            d['root_url'] = (_SRC_URLS.get(rk, '') % root.pk
+                             if rk in _SRC_URLS else '')
+        e['demands'].append(d)
+
+    for so in (SalesOrder.objects
+               .filter(status__in=SalesOrderStatusGroups.OPEN)
+               .select_related('customer')):
+        for li in so.lines.select_related('part').all():
+            if not li.part:
+                continue
+            demand(li.part, _line_need_so(li), 'SalesOrder', so.pk,
+                   so.reference, li.target_date or so.target_date)
+
+    roots = {}  # build_pk → 最上游订单（缓存，避免逐行爬链）
+    for bl in (BuildLine.objects
+               .filter(build__status__in=BuildStatusGroups.ACTIVE_CODES)
+               .select_related('bom_item__sub_part', 'build')
+               .all()):
+        p = bl.bom_item.sub_part if bl.bom_item else None
+        if not p:
+            continue
+        bo = bl.build
+        if bo.pk not in roots:
+            roots[bo.pk] = _root_source(bo)
+        demand(p, _line_need_build(bl), 'Build', bl.build_id,
+               bo.reference, bo.target_date, root=roots[bo.pk])
+
+    rows = []
+    for e in agg.values():
+        p = e['part']
+        e['stock'] = p.available_stock or 0
+        e['on_order'] = getattr(p, 'on_order', 0) or 0
+        e['building'] = getattr(p, 'quantity_being_built', 0) or 0
+        e['gap'] = _uncovered(p, e['need'])
+        e['pos'] = (PurchaseOrderLineItem.objects
+                    .filter(part__part=p,
+                            order__status__in=PurchaseOrderStatusGroups.OPEN)
+                    .values_list('order__pk', 'order__reference')
+                    .distinct())
+        e['bos'] = (Build.objects
+                    .filter(part=p, status__in=BuildStatusGroups.ACTIVE_CODES)
+                    .values_list('pk', 'reference'))
+        # 最低价供应商（按缺口数量取价）
+        sp = _pick_supplier_part(p, e['gap'] if e['gap'] > 0 else e['need'])
+        e['supplier'] = str(sp.supplier.name) if sp else ''
+        try:
+            e['price'] = sp.get_price(e['gap']) if sp else None
+        except Exception:
+            e['price'] = None
+        e['demands'].sort(key=lambda d: (d['date'] is None, d['date']))
+        e['earliest'] = next((d['date'] for d in e['demands']
+                              if d['date']), None)
+        rows.append(e)
+    rows.sort(key=lambda e: (e['gap'] <= 0,       # 有缺口的排前面
+                             e['earliest'] is None,
+                             e['earliest']))
+    return rows
+
+
+def order_trace(order):
+    """订单穿透树：SO→衍生BO/PO，BO→子BO/PO，逐层展开为扁平行列表。
+
+    返回 [{depth, kind, pk, ref, status, url, kitted}]，kind ∈
+    salesorder/build/purchaseorder，前端按 depth 缩进即可。
+    """
+    from build.models import Build
+    from order.models import PurchaseOrder
+
+    rows = []
+    labels = {'SalesOrder': '销售单', 'Build': '生产单',
+              'PurchaseOrder': '采购单', 'Part': '零件'}
+
+    def emit(obj, kind, depth):
+        url_tpl = _SRC_URLS.get(kind, '')
+        rows.append({
+            'depth': depth, 'd': min(depth, 8),
+            'kind': kind, 'pk': obj.pk,
+            'ref': _src_ref(obj),
+            'label': labels.get(kind, kind),
+            'status': (obj.get_status_display()
+                       if hasattr(obj, 'get_status_display') else ''),
+            'kitted': (obj.metadata or {}).get(META_KITTED),
+            'url': url_tpl % obj.pk if url_tpl else ''})
+
+    def walk(obj, kind, depth, seen):
+        key = (kind, obj.pk)
+        if key in seen:
+            return
+        seen.add(key)
+        emit(obj, kind, depth)
+        if kind == 'SalesOrder':
+            for b in Build.objects.filter(sales_order=obj):
+                walk(b, 'Build', depth + 1, seen)
+        if kind in ('SalesOrder', 'Build'):
+            src = '%s:%s' % (kind, obj.pk)
+            for po in PurchaseOrder.objects.filter(
+                    metadata__weiti_source=src):
+                walk(po, 'PurchaseOrder', depth + 1, seen)
+        if kind == 'Build':
+            for b in Build.objects.filter(parent=obj):
+                walk(b, 'Build', depth + 1, seen)
+
+    walk(order, order.__class__.__name__, 0, set())
+    return rows
