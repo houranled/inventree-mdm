@@ -745,24 +745,48 @@ def collect_bom_leaves(part, qty):
     return list(agg.values())
 
 
-def collect_bom_purchasables(part, qty):
+def collect_bom_purchasables(part, qty, net_open=False):
     """在摊平叶子件基础上分出 需采购/跳过 两组。
 
     返回 (buy, skipped)：
-      buy     = [{'part','need','qty','candidates'}]  qty=净缺口(扣可用/在产/在途)
-      skipped = [{'part','need','reason','stock','on_order','building'}]
+      buy     = [{'part','need','qty','candidates','on_order','committed'}]
+                qty=净缺口(扣可用/在产/在途)
+      skipped = [{'part','need','reason','stock','on_order','building',
+                  'committed'}]
+
+    net_open=True 按全局净额：供给池（库存+在途+在产）先偿还所有开放
+    SO/BO 已对该零件提出的需求，剩余"自由供给"才参与本单扣减——
+    防止已承诺给其它订单的在途 PO 被重复当作可用供给。
     """
+    committed = {}
+    if net_open:
+        committed = {r['part'].pk: r['need'] for r in collect_shortages()}
     skipped = []
     buy = []
     for e in collect_bom_leaves(part, qty):
         p = e['part']
+        stock = p.available_stock or 0
+        on_order = getattr(p, 'on_order', 0) or 0
+        building = getattr(p, 'quantity_being_built', 0) or 0
+        comm = committed.get(p.pk, Decimal(0))
+        if net_open:
+            free = (Decimal(str(stock)) + Decimal(str(on_order))
+                    + Decimal(str(building)) - Decimal(str(comm)))
+            gap = e['need'] - max(free, Decimal(0))
+            gap = max(gap, Decimal(0))
+        else:
+            gap = _uncovered(p, e['need'])
         if not p.purchaseable:
             skipped.append({'part': p, 'need': e['need'],
-                            'reason': '无下层BOM且未勾选可购买'})
+                            'reason': '无下层BOM且未勾选可购买',
+                            'committed': comm})
             continue
-        gap = _uncovered(p, e['need'])
         if gap > 0:
             e['qty'] = gap
+            e['stock'] = stock
+            e['on_order'] = on_order
+            e['building'] = building
+            e['committed'] = comm
             # 供应商候选：按缺口数量取价，价格升序（无价排末尾）
             cands = []
             for sp in p.supplier_parts.filter(
@@ -782,16 +806,16 @@ def collect_bom_purchasables(part, qty):
         else:
             skipped.append({'part': p, 'need': e['need'],
                             'reason': '库存/在途已覆盖',
-                            'stock': p.available_stock or 0,
-                            'on_order': getattr(p, 'on_order', 0) or 0,
-                            'building': getattr(p, 'quantity_being_built',
-                                                0) or 0})
+                            'stock': stock, 'on_order': on_order,
+                            'building': building, 'committed': comm})
     # 无下层BOM且不可采购的也补数字，便于排查
     for s in skipped:
         if 'stock' not in s:
-            s['stock'] = s['part'].available_stock or 0
-            s['on_order'] = getattr(s['part'], 'on_order', 0) or 0
-            s['building'] = getattr(s['part'], 'quantity_being_built', 0) or 0
+            p = s['part']
+            s['stock'] = p.available_stock or 0
+            s['on_order'] = getattr(p, 'on_order', 0) or 0
+            s['building'] = getattr(p, 'quantity_being_built', 0) or 0
+            s.setdefault('committed', committed.get(p.pk, Decimal(0)))
     return buy, skipped
 
 

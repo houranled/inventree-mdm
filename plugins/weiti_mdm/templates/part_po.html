@@ -26,8 +26,10 @@
 </head>
 <body>
   <h1>按BOM生成采购单 — {{ part.IPN }} {{ part.name }}</h1>
-  <p class="hint">逐层下钻到最底层可采购件；净缺口 = 需求 − 可用库存 − 在产 − 在途采购。
-    供应商默认取按缺口数量的最低价，可改选。</p>
+  <p class="hint">逐层下钻到最底层可采购件。
+    全局净额口径：供给池（库存+在途+在产）先扣除其它开放订单已承诺的需求，
+    再算本单净缺口；<span style="color:#b3261e">「已承诺」</span>标记的在途
+    不可当作本单可用供给。供应商默认取按缺口数量的最低价，可改选。</p>
 
   <form method="get">
     生产/备货数量：<input type="number" name="qty" min="1" step="1"
@@ -59,6 +61,7 @@
     <table>
       <tr><th>IPN</th><th>名称</th><th class="num">需求</th>
           <th class="num">净缺口</th><th class="num">在途</th>
+          <th class="num">在产</th>
           <th>供应商</th><th class="num">单价</th><th class="num">小计</th></tr>
       {% for e in buy %}
       <tr data-qty="{{ e.qty }}">
@@ -66,7 +69,23 @@
         <td>{{ e.part.name }}</td>
         <td class="num">{{ e.need|floatformat:"-2" }}</td>
         <td class="num"><b>{{ e.qty|floatformat:"-2" }}</b></td>
-        <td class="num">{{ e.part.on_order|floatformat:"-2" }}</td>
+        <td class="num">
+          {{ e.on_order|floatformat:"-2" }}
+          {% for pk, ref in e.pos %}
+            <a class="plain"
+              href="/web/purchasing/purchase-order/{{ pk }}/">{{ ref }}</a>
+          {% endfor %}
+          {% if e.committed > 0 %}
+            <br><span class="bad">已承诺 {{ e.committed|floatformat:"-2" }}</span>
+          {% endif %}
+        </td>
+        <td class="num">
+          {{ e.building|floatformat:"-2" }}
+          {% for pk, ref in e.bos %}
+            <a class="plain"
+              href="/web/manufacturing/build-order/{{ pk }}/">{{ ref }}</a>
+          {% endfor %}
+        </td>
         <td>
           {% if e.candidates %}
           <select name="sp_{{ e.part.pk }}" class="sp-sel">
@@ -118,13 +137,16 @@
           <a class="plain"
             href="/web/purchasing/purchase-order/{{ pk }}/">{{ ref }}</a>
         {% endfor %}
+        {% if s.committed > 0 %}
+          <br><span class="bad">已承诺 {{ s.committed|floatformat:"-2" }}</span>
+        {% endif %}
       </td>
       <td class="num">
         {{ s.building|floatformat:"-2" }}
         {% for pk, ref in s.bos %}
           <a class="plain"
             href="/web/manufacturing/build-order/{{ pk }}/">{{ ref }}</a>
-        {% endfor %}
+          {% endfor %}
       </td>
       <td class="bad">{{ s.reason }}</td>
     </tr>

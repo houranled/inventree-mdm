@@ -510,9 +510,13 @@ def assign_ipn(part):
 
     # 类别未绑定参数模板 → 无规格零件，直接发正式流水码
     # 旧占位码 !{code}-Tnnnn 视为可迁移格式，重写成 S 码；
-    # 已有 S 码或其他合规码则保持不变
+    # 已有 S 码或其他合规码则保持不变——但前缀过期的自动 S 码
+    #（零件被移动到新类别，如 401-S0001 → 205 类）按新前缀重发
     if cur and not cur.startswith(f'!{code}-T'):
-        return False
+        stale_auto = (re.match(r'^\d+-S\d+$', cur)
+                      and not cur.startswith(f'{code}-S'))
+        if not stale_auto:
+            return False
     from part.models import Part
     prefix = f'{code}-S'
     nums = []
@@ -1315,7 +1319,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             qty = D('1')
         created = None
         if request.method == 'POST' and request.POST.get('action') == 'create':
-            buy0, _ = orderflow.collect_bom_purchasables(part, qty)
+            buy0, _ = orderflow.collect_bom_purchasables(
+                part, qty, net_open=True)
             # 读取每行选定的供应商零件（sp_<part_pk>=<sp_pk>）
             from company.models import SupplierPart
             for e in buy0:
@@ -1328,13 +1333,15 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             created = orderflow.create_pos_for_part(self, buy0, part)
 
         # 展示态：建单后重新收集（刚建的 PO 计入在途，行自动移入跳过项）
-        buy, skipped = orderflow.collect_bom_purchasables(part, qty)
-        # 跳过项补在途/在产单号，便于溯源
+        # net_open：供给池先偿还其它开放订单已承诺的需求，再算本单缺口
+        buy, skipped = orderflow.collect_bom_purchasables(
+            part, qty, net_open=True)
+        # 需采购/跳过项都补在途/在产单号，便于溯源
         from order.models import PurchaseOrderLineItem
         from order.status_codes import PurchaseOrderStatusGroups
         from build.models import Build
         from build.status_codes import BuildStatusGroups
-        for s in skipped:
+        for s in list(buy) + skipped:
             p = s['part']
             s['pos'] = (
                 PurchaseOrderLineItem.objects
