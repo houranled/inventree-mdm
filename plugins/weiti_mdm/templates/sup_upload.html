@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>供应商信息导入</title>
+  <style>
+    body { font-family: system-ui, "Microsoft YaHei", sans-serif; max-width: 760px;
+           margin: 32px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 20px; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-top: 16px; }
+    label { display: block; margin: 12px 0 4px; font-weight: 600; }
+    input[type=text], input[type=file], select { width: 100%; padding: 8px;
+           box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; }
+    .hint { color: #888; font-size: 13px; margin-top: 4px; }
+    .btn { margin-top: 18px; background: #2f6feb; color: #fff; border: 0; padding: 10px 20px;
+           border-radius: 6px; font-size: 15px; cursor: pointer; }
+    .err { background: #fdecea; color: #b3261e; padding: 10px 14px; border-radius: 6px;
+           margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <h1>供应商信息导入（零件 ↔ 供应商关联）</h1>
+  <p class="hint">上传供应商/报价文件 → 下一步映射列 → 预览（零件按 IPN/名称匹配，供应商自动建）→ 确认落库。</p>
+
+  {% if error %}<div class="err">{{ error }}</div>{% endif %}
+
+  <div class="card">
+    <form method="post" enctype="multipart/form-data">
+      {% csrf_token %}
+      <input type="hidden" name="action" value="upload">
+
+      <label>供应商文件（.xlsx / .xls / .csv）</label>
+      <input type="file" name="file" accept=".xlsx,.xls,.csv" required>
+      <div class="hint">
+        支持多工作表；表头在前 3 行内自动识别。<br>
+        必需的列：<b>零件标识</b>（内部零件编码 IPN 或名称，与 BOM 导入建的零件对应）
+        和<b>供应商</b>。<br>
+        可选列：制造商/品牌、制造商型号(MPN)、供应商料号(SKU)、单价、起订量、备注。
+      </div>
+
+      <button class="btn" type="submit">下一步：映射列</button>
+    </form>
+  </div>
+</body>
+</html>

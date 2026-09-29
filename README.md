@@ -50,7 +50,8 @@ sudo docker compose up -d
 
 ## 六、物料主数据插件 weiti_mdm（自定义）
 
-本目录 `plugins/weiti_mdm/` 是物料主数据插件（类别/选项编号 + IPN + BOM导入/导出），
+本目录 `plugins/weiti_mdm/` 是物料主数据插件（类别/选项编号 + IPN
++ BOM导入/导出 + 供应商导入），
 `scripts/assign_ipns.py` 是存量零件批量补码脚本，
 `scripts/backfill_params.py` 是存量零件补建类别参数行脚本。
 
@@ -163,6 +164,37 @@ IPN = {小类码}-{规格段}   例: 102-030110301（无流水号，同规格同
 
 > 依赖插件文件：`bom_import.py`、`bom_export.py` 与 `templates/weiti_mdm/*.html`，
 > 与 `__init__.py` 一起放在 `plugins/weiti_mdm/` 下，改动后重启容器。
+
+### 供应商信息导入（零件 ↔ 供应商/制造商关联）
+
+插件页面地址：`http://192.168.1.188:1337/plugin/weiti_mdm/supplier-import/`
+（左侧导航「供应商导入」也可直达）。用于把供应商/报价文件里的采购信息
+挂到**已有零件**上——典型用法是先 BOM 导入建零件，再导供应商清单补采购数据。
+
+#### 落库对象
+
+| Excel 列（可映射） | 写入模型 | 去重键 |
+|---|---|---|
+| 零件标识（IPN 或名称，必填） | 匹配 `Part`（先 IPN 精确，再名称） | — |
+| 供应商（必填） | `Company`（自动补 `is_supplier`） | 名称 |
+| 制造商/品牌 + 制造商型号 | `Company`(`is_manufacturer`) + `ManufacturerPart` | (零件, 制造商, MPN) |
+| 供应商料号 SKU | `SupplierPart.SKU`（留空用零件 IPN） | (零件, 供应商, SKU) |
+| 单价 + 起订量 | `SupplierPriceBreak` | (供应商件, 数量)，同量更新价格 |
+| 备注 | `SupplierPart.note` | — |
+
+#### 流程
+
+1. **上传**：供应商/报价文件（xlsx/xls/csv），多 tab 均会解析；
+2. **映射列**：每 tab 独立配置，零件标识和供应商必填；页面顶部统一选币种
+   （默认 CNY）；
+3. **预览**：事务回滚不落库，按工作表分组报告新建/复用/价格/失败
+   ——零件找不到、名称多匹配、单价无法解析都会标红；
+4. **确认导入**：每表一个事务，失败整表回滚不中断后续表。
+
+复用已有 `SupplierPart` 时会顺带补 `manufacturer_part` 链接和空的 `note`；
+复用 `Company` 时按需补 `is_supplier`/`is_manufacturer` 标记。
+
+> 依赖插件文件：`supplier_import.py` 与 `templates/sup_*.html`。
 
 ### 存量零件批量补码
 

@@ -799,6 +799,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                  name='bom-export-tree'),
             path('bom-export-multi/', self.view_bom_export_multi,
                  name='bom-export-multi'),
+            path('supplier-import/', self.view_supplier_import,
+                 name='supplier-import'),
         ]
 
     # ---------- 零件详情页"BOM导入"按钮（primary_action UI 特性） ----------
@@ -868,6 +870,11 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
             'title': 'BOM导入',
             'icon': 'ti:list-plus:outline',
             'options': {'url': '/plugin/weiti_mdm/bom-import/'},
+        }, {
+            'key': 'weiti-supplier-import-nav',
+            'title': '供应商导入',
+            'icon': 'ti:building-store:outline',
+            'options': {'url': '/plugin/weiti_mdm/supplier-import/'},
         }]
 
     def view_bom_js(self, request):
@@ -1278,6 +1285,156 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
 
         # 步骤1：GET → 上传页
         return self._render(request, 'bom_upload.html', ctx)
+
+    # --------------------------------------------------------------
+    # 供应商/制造商导入页面
+    # 访问: /plugin/weiti_mdm/supplier-import/
+    # --------------------------------------------------------------
+
+    def view_supplier_import(self, request):
+        """供应商信息导入：零件标识(IPN/名称) → Company → SupplierPart
+        (+ManufacturerPart + 价格)。流程同 BOM 导入：上传→映射→预览→提交。"""
+        from django.http import HttpResponseForbidden
+        import bom_import
+        import supplier_import
+
+        if not (request.user.is_authenticated and request.user.is_staff):
+            return HttpResponseForbidden('需要以员工(staff)身份登录')
+
+        ctx = {'plugin': self}
+        action = request.POST.get('action', '') if request.method == 'POST' else ''
+
+        # 步骤2：上传 → 逐表解析 → 映射页
+        if action == 'upload':
+            import json
+            import uuid
+            from django.conf import settings as dj_settings
+
+            f = request.FILES.get('file')
+            if not f:
+                ctx['error'] = '请提供供应商文件'
+                return self._render(request, 'sup_upload.html', ctx)
+            try:
+                sheets = bom_import.parse_all_sheets(f)
+            except Exception as e:
+                ctx['error'] = f'文件解析失败: {e}'
+                return self._render(request, 'sup_upload.html', ctx)
+            if not sheets:
+                ctx['error'] = '文件中没有可解析的工作表（需有表头和数据行）'
+                return self._render(request, 'sup_upload.html', ctx)
+
+            work = os.path.join(dj_settings.MEDIA_ROOT, 'tmp',
+                                f'sup_{uuid.uuid4().hex[:12]}')
+            os.makedirs(work, exist_ok=True)
+            meta, sheets_view = [], []
+            for idx, s in enumerate(sheets):
+                srows = [{k: ('' if v is None else str(v))
+                          for k, v in r.items()} for r in s['rows']]
+                with open(os.path.join(work, f'sheet_{idx}.json'),
+                          'w', encoding='utf-8') as fh:
+                    json.dump({'headers': s['headers'], 'rows': srows},
+                              fh, ensure_ascii=False)
+                meta.append({'sheet': s['sheet'],
+                             'json': f'sheet_{idx}.json',
+                             'rows': len(srows)})
+                sheets_view.append({
+                    'idx': idx, 'sheet': s['sheet'],
+                    'headers': s['headers'], 'rows': len(srows),
+                    'preview': [[r.get(h, '') for h in s['headers']]
+                                for r in srows[:3]],
+                    'guess': supplier_import.guess_columns(s['headers'])})
+            request.session['sup_work'] = work
+            request.session['sup_sheets'] = meta
+            ctx.update({'sheets_view': sheets_view,
+                        'row_count': sum(m['rows'] for m in meta)})
+            return self._render(request, 'sup_map.html', ctx)
+
+        # 步骤3/4：预览(dry-run) 或 提交
+        if action in ('preview', 'commit'):
+            import json
+            import shutil
+            from django.db import transaction
+
+            work = request.session.get('sup_work', '')
+            meta = request.session.get('sup_sheets', [])
+            if not work or not meta:
+                ctx['error'] = '会话已过期，请重新上传'
+                return self._render(request, 'sup_upload.html', ctx)
+            currency = (request.POST.get('currency', '') or 'CNY').strip()
+
+            sheet_data = []
+            for m in meta:
+                with open(os.path.join(work, m['json']),
+                          encoding='utf-8') as fh:
+                    sd = json.load(fh)
+                sheet_data.append((m, sd['headers'], sd['rows']))
+
+            # 每个工作表独立一套列映射
+            mappings = [{k: request.POST.get(f'scol_{k}_{idx}', '')
+                         for k in supplier_import.MAP_FIELDS}
+                        for idx in range(len(sheet_data))]
+            if any(not mp['part'] or not mp['supplier'] for mp in mappings):
+                sheets_view = []
+                for idx, (m, hdrs, rows) in enumerate(sheet_data):
+                    sheets_view.append({
+                        'idx': idx, 'sheet': m['sheet'], 'headers': hdrs,
+                        'rows': m['rows'],
+                        'preview': [[r.get(h, '') for h in hdrs]
+                                    for r in rows[:3]],
+                        'guess': mappings[idx]})
+                ctx.update({'sheets_view': sheets_view,
+                            'row_count': sum(m['rows'] for m in meta),
+                            'currency': currency,
+                            'error': ('每个工作表都必须指定'
+                                      '「零件标识」和「供应商」列')})
+                return self._render(request, 'sup_map.html', ctx)
+
+            dry = action == 'preview'
+            report = {'created': 0, 'reused': 0, 'prices': 0,
+                      'failed': 0, 'groups': []}
+            for idx, (m, _h, rows) in enumerate(sheet_data):
+                try:
+                    with transaction.atomic():
+                        sub = supplier_import.run_import(
+                            rows, mappings[idx], dry_run=dry,
+                            currency=currency)
+                        if dry:
+                            raise bom_import._Rollback()
+                except bom_import._Rollback:
+                    pass
+                except Exception as e:
+                    # 整表回滚，不中断后续工作表
+                    logger.exception(
+                        'WeiTiMDM.sup: 工作表「%s」导入失败', m['sheet'])
+                    sub = {'created': 0, 'reused': 0, 'prices': 0,
+                           'failed': max(1, len(rows)),
+                           'lines': [{'row': '—', 'name': m['sheet'],
+                                      'action': 'error', 'cat': '',
+                                      'note': (f'导入失败，本表已整体'
+                                               f'回滚：{e}'),
+                                      'ok': False}]}
+                report['groups'].append({'sheet': m['sheet'], 'sub': sub})
+                for k in ('created', 'reused', 'prices', 'failed'):
+                    report[k] += sub[k]
+
+            if dry:
+                mfields = []
+                for idx, mp in enumerate(mappings):
+                    for k in supplier_import.MAP_FIELDS:
+                        mfields.append((f'scol_{k}_{idx}', mp[k]))
+                mfields.append(('currency', currency))
+                ctx.update({'report': report, 'mfields': mfields,
+                            'currency': currency, 'dry_run': True})
+                return self._render(request, 'sup_report.html', ctx)
+
+            request.session.pop('sup_work', None)
+            request.session.pop('sup_sheets', None)
+            shutil.rmtree(work, ignore_errors=True)
+            ctx.update({'report': report, 'currency': currency,
+                        'dry_run': False})
+            return self._render(request, 'sup_report.html', ctx)
+
+        return self._render(request, 'sup_upload.html', ctx)
 
     @staticmethod
     def _guess_columns(headers):
