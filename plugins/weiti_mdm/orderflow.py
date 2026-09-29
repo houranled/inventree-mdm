@@ -265,6 +265,23 @@ def _responsible_of(order):
     return getattr(order, 'responsible', None)
 
 
+def _pick_supplier_part(part, qty):
+    """按缺口数量取最低价的供应商零件；全部无价时按 pk 取第一个。"""
+    sps = (part.supplier_parts
+           .filter(supplier__active=True, supplier__is_supplier=True))
+    best, best_price = None, None
+    for sp in sps:
+        try:
+            p = sp.get_price(qty)
+            amt = float(p.amount) if p is not None else None
+        except Exception:
+            amt = None
+        if best is None or (amt is not None and
+                            (best_price is None or amt < best_price)):
+            best, best_price = sp, amt
+    return best
+
+
 def _autocreate_active():
     """Auto Create Builds 内置插件启用时，assembly 缺料交给它处理。"""
     try:
@@ -303,16 +320,19 @@ def _create_po_lines(plugin, items, source_order, need_by):
     groups = {}
     for it in items:
         part, qty = it['part'], it['qty']
-        sp = (part.supplier_parts
-              .filter(supplier__active=True, supplier__is_supplier=True)
-              .order_by('pk').first())
+        # 预览页选定的供应商零件优先；否则按缺口数量自动取最低价
+        sp = it.get('sp') or _pick_supplier_part(part, qty)
         if not sp:
             logger.warning('WeiTiMDM: %s 无可用供应商零件，无法自动建采购行',
                            part.IPN or part.name)
             continue
+        try:
+            price = sp.get_price(qty)
+        except Exception:
+            price = None
         groups.setdefault(sp.supplier_id, {'supplier': sp.supplier,
                                            'lines': []})['lines'].append(
-            (sp, part, qty))
+            (sp, part, qty, price))
     created = []
     src_kind = source_order.__class__.__name__
     tpl = _SRC_URLS.get(src_kind, '')
@@ -327,12 +347,13 @@ def _create_po_lines(plugin, items, source_order, need_by):
             target_date=need_by,
             project_code=getattr(source_order, 'project_code', None),
             metadata={META_SRC: '%s:%s' % (src_kind, source_order.pk)})
-        for sp, part, qty in g['lines']:
+        for sp, part, qty, price in g['lines']:
             PurchaseOrderLineItem.objects.create(
                 order=po, part=sp, quantity=qty,
                 target_date=need_by,
                 reference=str(part.IPN or ''),
-                notes='来源 %s' % src_ref)
+                notes='来源 %s' % src_ref,
+                purchase_price=price)
         created.append(po)
         logger.info('WeiTiMDM: 自动生成采购单 %s (%d 行, 来源 %s)',
                     po.reference, len(g['lines']), src_ref)
@@ -640,17 +661,12 @@ def task_check_build(build_id):
 # 零件级"按BOM采购"
 # ------------------------------------------------------------------
 
-def collect_bom_purchasables(part, qty):
-    """逐层下钻 BOM 到叶子可采购件。
+def collect_bom_leaves(part, qty):
+    """逐层下钻 BOM 聚合叶子件需求（有下层BOM的子件视为制造，继续下钻）。
 
-    规则：子件有下层 BOM → 继续下钻（按制造算）；
-          叶子且 purchaseable → 计入采购需求（跨分支聚合后算净缺口）；
-          叶子且不可采购 → 记入跳过清单。
-    返回 (buy, skipped)：
-      buy     = [{'part','need','qty'}]  qty=净缺口(扣可用/在产/在途)
-      skipped = [{'part','need','reason'}]
+    返回 [{'part', 'need'}]，need 已按单层用量 × qty × 层级系数聚合。
     """
-    agg, skipped = {}, []
+    agg = {}
 
     def walk(p, factor, path):
         for it in p.bom_items.select_related('sub_part').all():
@@ -660,24 +676,62 @@ def collect_bom_purchasables(part, qty):
             need = Decimal(str(it.quantity)) * Decimal(str(factor))
             if sub.bom_items.exists():
                 walk(sub, need, path | {sub.pk})
-            elif sub.purchaseable:
+            else:
                 agg.setdefault(
                     sub.pk, {'part': sub, 'need': Decimal(0)}
                 )['need'] += need
-            else:
-                skipped.append({'part': sub, 'need': need,
-                                'reason': '无下层BOM且未勾选可购买'})
 
     walk(part, Decimal(str(qty)), {part.pk})
+    return list(agg.values())
+
+
+def collect_bom_purchasables(part, qty):
+    """在摊平叶子件基础上分出 需采购/跳过 两组。
+
+    返回 (buy, skipped)：
+      buy     = [{'part','need','qty','candidates'}]  qty=净缺口(扣可用/在产/在途)
+      skipped = [{'part','need','reason','stock','on_order','building'}]
+    """
+    skipped = []
     buy = []
-    for e in agg.values():
-        gap = _uncovered(e['part'], e['need'])
+    for e in collect_bom_leaves(part, qty):
+        p = e['part']
+        if not p.purchaseable:
+            skipped.append({'part': p, 'need': e['need'],
+                            'reason': '无下层BOM且未勾选可购买'})
+            continue
+        gap = _uncovered(p, e['need'])
         if gap > 0:
             e['qty'] = gap
+            # 供应商候选：按缺口数量取价，价格升序（无价排末尾）
+            cands = []
+            for sp in p.supplier_parts.filter(
+                    supplier__active=True, supplier__is_supplier=True):
+                try:
+                    price = sp.get_price(gap)
+                except Exception:
+                    price = None
+                cands.append({'sp_pk': sp.pk, 'sp': sp,
+                              'supplier': str(sp.supplier.name),
+                              'sku': sp.SKU or '',
+                              'price': price})
+            cands.sort(key=lambda c: float(c['price'].amount)
+                       if c['price'] is not None else float('inf'))
+            e['candidates'] = cands
             buy.append(e)
         else:
-            skipped.append({'part': e['part'], 'need': e['need'],
-                            'reason': '库存/在途已覆盖'})
+            skipped.append({'part': p, 'need': e['need'],
+                            'reason': '库存/在途已覆盖',
+                            'stock': p.available_stock or 0,
+                            'on_order': getattr(p, 'on_order', 0) or 0,
+                            'building': getattr(p, 'quantity_being_built',
+                                                0) or 0})
+    # 无下层BOM且不可采购的也补数字，便于排查
+    for s in skipped:
+        if 'stock' not in s:
+            s['stock'] = s['part'].available_stock or 0
+            s['on_order'] = getattr(s['part'], 'on_order', 0) or 0
+            s['building'] = getattr(s['part'], 'quantity_being_built', 0) or 0
     return buy, skipped
 
 

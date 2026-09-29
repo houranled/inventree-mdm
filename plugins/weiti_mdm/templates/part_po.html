@@ -6,7 +6,7 @@
   <title>按BOM生成采购单</title>
   <style>
     body { font-family: system-ui, "Microsoft YaHei", sans-serif;
-           max-width: 960px; margin: 32px auto; padding: 0 16px; color: #222; }
+           max-width: 1100px; margin: 32px auto; padding: 0 16px; color: #222; }
     h1 { font-size: 20px; }
     h3 { font-size: 15px; margin-top: 20px; }
     .hint { color: #888; font-size: 13px; }
@@ -16,14 +16,18 @@
     th { background: #f6f8fa; }
     .ipn { font-family: ui-monospace, monospace; }
     .bad { color: #b3261e; }
+    .num { text-align: right; }
     a.plain { color: #2f6feb; text-decoration: none; }
     input[type=number] { width: 80px; padding: 4px; }
+    select { padding: 3px; max-width: 220px; }
     button { padding: 6px 18px; }
+    #total { font-weight: 700; }
   </style>
 </head>
 <body>
   <h1>按BOM生成采购单 — {{ part.IPN }} {{ part.name }}</h1>
-  <p class="hint">逐层下钻到最底层可采购件；净缺口 = 需求 − 可用库存 − 在产 − 在途采购。</p>
+  <p class="hint">逐层下钻到最底层可采购件；净缺口 = 需求 − 可用库存 − 在产 − 在途采购。
+    供应商默认取按缺口数量的最低价，可改选。</p>
 
   <form method="get">
     生产/备货数量：<input type="number" name="qty" min="1" step="1"
@@ -53,22 +57,42 @@
     <input type="hidden" name="qty" value="{{ qty }}">
     <input type="hidden" name="action" value="create">
     <table>
-      <tr><th>IPN</th><th>名称</th><th>需求</th><th>净缺口</th>
-          <th>供应商</th><th>SKU</th></tr>
+      <tr><th>IPN</th><th>名称</th><th class="num">需求</th>
+          <th class="num">净缺口</th><th class="num">在途</th>
+          <th>供应商</th><th class="num">单价</th><th class="num">小计</th></tr>
       {% for e in buy %}
-      <tr>
+      <tr data-qty="{{ e.qty }}">
         <td class="ipn">{{ e.part.IPN }}</td>
         <td>{{ e.part.name }}</td>
-        <td>{{ e.need }}</td>
-        <td><b>{{ e.qty }}</b></td>
-        <td>{{ e.supplier|default:"—" }}</td>
-        <td>{{ e.sku }}</td>
+        <td class="num">{{ e.need|floatformat:"-2" }}</td>
+        <td class="num"><b>{{ e.qty|floatformat:"-2" }}</b></td>
+        <td class="num">{{ e.part.on_order|floatformat:"-2" }}</td>
+        <td>
+          {% if e.candidates %}
+          <select name="sp_{{ e.part.pk }}" class="sp-sel">
+            {% for c in e.candidates %}
+            <option value="{{ c.sp_pk }}"
+              data-price="{{ c.price.amount|default:'' }}">
+              {{ c.supplier }}{% if c.sku %} · {{ c.sku }}{% endif %}
+              {% if c.price %} · {{ c.price }}{% else %} · 无报价{% endif %}
+            </option>
+            {% endfor %}
+          </select>
+          {% else %}
+            <span class="bad">无供应商零件</span>
+          {% endif %}
+        </td>
+        <td class="num unit-price">
+          {% if e.candidates.0.price %}{{ e.candidates.0.price }}{% else %}—{% endif %}
+        </td>
+        <td class="num subtotal"></td>
       </tr>
       {% endfor %}
     </table>
     <p style="margin-top:12px">
       <button type="submit">按供应商分组生成采购单</button>
-      <span class="hint">无供应商的项会被跳过并记日志</span>
+      <span class="hint">预计合计 <span id="total">—</span>
+        （无供应商的项会被跳过并记日志）</span>
     </p>
   </form>
   {% else %}
@@ -79,12 +103,29 @@
   {% if skipped %}
   <h3>跳过项（{{ skipped|length }}）</h3>
   <table>
-    <tr><th>IPN</th><th>名称</th><th>需求</th><th>原因</th></tr>
+    <tr><th>IPN</th><th>名称</th><th class="num">需求</th>
+        <th class="num">库存</th><th class="num">在途</th>
+        <th class="num">在产</th><th>原因</th></tr>
     {% for s in skipped %}
     <tr>
       <td class="ipn">{{ s.part.IPN }}</td>
       <td>{{ s.part.name }}</td>
-      <td>{{ s.need }}</td>
+      <td class="num">{{ s.need|floatformat:"-2" }}</td>
+      <td class="num">{{ s.stock|floatformat:"-2" }}</td>
+      <td class="num">
+        {{ s.on_order|floatformat:"-2" }}
+        {% for pk, ref in s.pos %}
+          <a class="plain"
+            href="/web/purchasing/purchase-order/{{ pk }}/">{{ ref }}</a>
+        {% endfor %}
+      </td>
+      <td class="num">
+        {{ s.building|floatformat:"-2" }}
+        {% for pk, ref in s.bos %}
+          <a class="plain"
+            href="/web/manufacturing/build-order/{{ pk }}/">{{ ref }}</a>
+        {% endfor %}
+      </td>
       <td class="bad">{{ s.reason }}</td>
     </tr>
     {% endfor %}
@@ -95,5 +136,39 @@
     <a class="plain" href="/web/part/{{ part.pk }}/">← 返回零件</a> ·
     <a class="plain" href="/plugin/weiti_mdm/schedule/">排单看板</a>
   </p>
+
+  <script>
+    // 选供应商时实时重算单价、小计、合计
+    function recalc() {
+      var total = 0, has = false;
+      document.querySelectorAll('tr[data-qty]').forEach(function (tr) {
+        var sel = tr.querySelector('.sp-sel');
+        var qty = parseFloat(tr.dataset.qty) || 0;
+        var price = null;
+        if (sel) {
+          var opt = sel.options[sel.selectedIndex];
+          var v = opt && opt.dataset.price;
+          if (v !== undefined && v !== '') { price = parseFloat(v); }
+        }
+        var upCell = tr.querySelector('.unit-price');
+        var stCell = tr.querySelector('.subtotal');
+        if (price !== null && !isNaN(price)) {
+          var sub = price * qty;
+          if (upCell) { upCell.textContent = '¥' + price.toFixed(2); }
+          if (stCell) { stCell.textContent = '¥' + sub.toFixed(2); }
+          total += sub; has = true;
+        } else {
+          if (upCell && sel) { upCell.textContent = '—'; }
+          if (stCell) { stCell.textContent = '—'; }
+        }
+      });
+      var t = document.getElementById('total');
+      if (t) { t.textContent = has ? ('¥' + total.toFixed(2)) : '—'; }
+    }
+    document.querySelectorAll('.sp-sel').forEach(function (s) {
+      s.addEventListener('change', recalc);
+    });
+    recalc();
+  </script>
 </body>
 </html>

@@ -921,6 +921,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                  name='schedule-board'),
             path('part-po/<int:pk>/', self.view_part_po,
                  name='part-po'),
+            path('part-table/<int:pk>/', self.view_part_table,
+                 name='part-table'),
         ]
 
     # ---------- 零件详情页"BOM导入"按钮（primary_action UI 特性） ----------
@@ -966,6 +968,14 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                 'icon': 'ti:building-store:outline',
                 'options': {'color': 'blue'},
                 'context': {'url': f'/plugin/weiti_mdm/part-po/{pk}/'},
+                'source': '/plugin/weiti_mdm/bom-import.js',
+            })
+            actions.append({
+                'key': 'weiti-part-table',
+                'title': '物料总表',
+                'icon': 'ti:table:outline',
+                'options': {'color': 'cyan'},
+                'context': {'url': f'/plugin/weiti_mdm/part-table/{pk}/'},
                 'source': '/plugin/weiti_mdm/bom-import.js',
             })
             # 子件里有装配体 → 再加"导出BOM树"（多 tab 整树导出）
@@ -1115,6 +1125,31 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                         'icon': 'ti:building-store:outline',
                         'context': {'kind': 'po', 'orders': orders},
                         'source': src})
+                # 物料总表：摊平到叶子件的简表面板
+                from part.models import Part
+                part = Part.objects.get(pk=pk)
+                if part.bom_items.exists():
+                    import orderflow
+                    rows = []
+                    for e in orderflow.collect_bom_leaves(part, 1):
+                        p = e['part']
+                        rows.append({
+                            'pk': p.pk, 'ipn': p.IPN or '', 'name': p.name,
+                            'need': str(e['need']),
+                            'stock': str(p.available_stock or 0),
+                            'on_order': str(getattr(p, 'on_order', 0) or 0),
+                            'gap': str(orderflow._uncovered(p, e['need']))})
+                    if rows:
+                        panels.append({
+                            'key': 'weiti-part-table',
+                            'title': '物料总表',
+                            'icon': 'ti:table:outline',
+                            'context': {
+                                'rows': rows,
+                                'full_url': '/plugin/weiti_mdm/part-table/'
+                                            '%s/' % pk},
+                            'source': '/plugin/weiti_mdm/bom-import.js'
+                                      ':renderPartTablePanel'})
         except Exception:
             pass
         return panels
@@ -1232,18 +1267,120 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                     or request.GET.get('qty') or '1')
         except Exception:
             qty = D('1')
-        buy, skipped = orderflow.collect_bom_purchasables(part, qty)
-        for e in buy:  # 预览带上供应商/SKU
-            sp = e['part'].supplier_parts.filter(
-                supplier__active=True, supplier__is_supplier=True
-            ).order_by('pk').first()
-            e['supplier'] = sp.supplier.name if sp else None
-            e['sku'] = sp.SKU if sp else ''
-            e['ok'] = bool(sp)
-        ctx = {'part': part, 'qty': qty, 'buy': buy, 'skipped': skipped}
+        created = None
         if request.method == 'POST' and request.POST.get('action') == 'create':
-            ctx['created'] = orderflow.create_pos_for_part(self, buy, part)
+            buy0, _ = orderflow.collect_bom_purchasables(part, qty)
+            # 读取每行选定的供应商零件（sp_<part_pk>=<sp_pk>）
+            from company.models import SupplierPart
+            for e in buy0:
+                sp_pk = request.POST.get('sp_%s' % e['part'].pk)
+                if sp_pk:
+                    try:
+                        e['sp'] = SupplierPart.objects.get(pk=sp_pk)
+                    except SupplierPart.DoesNotExist:
+                        pass
+            created = orderflow.create_pos_for_part(self, buy0, part)
+
+        # 展示态：建单后重新收集（刚建的 PO 计入在途，行自动移入跳过项）
+        buy, skipped = orderflow.collect_bom_purchasables(part, qty)
+        # 跳过项补在途/在产单号，便于溯源
+        from order.models import PurchaseOrderLineItem
+        from order.status_codes import PurchaseOrderStatusGroups
+        from build.models import Build
+        from build.status_codes import BuildStatusGroups
+        for s in skipped:
+            p = s['part']
+            s['pos'] = (
+                PurchaseOrderLineItem.objects
+                .filter(part__part=p,
+                        order__status__in=PurchaseOrderStatusGroups.OPEN)
+                .values_list('order__pk', 'order__reference')
+                .distinct())
+            s['bos'] = (Build.objects
+                        .filter(part=p,
+                                status__in=BuildStatusGroups.ACTIVE_CODES)
+                        .values_list('pk', 'reference'))
+        ctx = {'part': part, 'qty': qty, 'buy': buy,
+               'skipped': skipped, 'created': created}
         return self._render(request, 'part_po.html', ctx)
+
+    # ---------- 物料明细总表（摊平到叶子件） ----------
+
+    def view_part_table(self, request, pk):
+        """整机物料明细总表：摊平到叶子件，合并工程/库存/采购列。"""
+        from decimal import Decimal as D
+        from django.http import HttpResponse, HttpResponseForbidden
+        from part.models import Part
+        import orderflow
+
+        if not (request.user.is_authenticated and request.user.is_staff):
+            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        try:
+            part = Part.objects.get(pk=pk)
+        except Part.DoesNotExist:
+            return HttpResponse('零件不存在', status=404)
+
+        try:
+            qty = D(request.GET.get('qty') or '1')
+        except Exception:
+            qty = D('1')
+
+        from order.models import PurchaseOrderLineItem
+        from order.status_codes import PurchaseOrderStatusGroups
+        from build.models import Build
+        from build.status_codes import BuildStatusGroups
+
+        rows = []
+        for e in orderflow.collect_bom_leaves(part, qty):
+            p, need = e['part'], e['need']
+            # 规格参数拼接（类别模板的键值对）
+            try:
+                spec = '；'.join(
+                    '%s=%s' % (x.template.name, str(x.data).strip())
+                    for x in p.parameters.select_related('template').all()
+                    if str(x.data or '').strip())
+            except Exception:
+                spec = ''
+            # 供应商：按需求数量取最低价（复用采购行逻辑）
+            sp = orderflow._pick_supplier_part(p, need)
+            price, lead = None, ''
+            if sp:
+                try:
+                    price = sp.get_price(need)
+                except Exception:
+                    price = None
+                lead = (sp.metadata or {}).get('lead_time_days', '') or ''
+            pos = (PurchaseOrderLineItem.objects
+                   .filter(part__part=p,
+                           order__status__in=PurchaseOrderStatusGroups.OPEN)
+                   .values_list('order__pk', 'order__reference')
+                   .distinct())
+            bos = (Build.objects
+                   .filter(part=p,
+                           status__in=BuildStatusGroups.ACTIVE_CODES)
+                   .values_list('pk', 'reference'))
+            stock = p.available_stock or 0
+            on_order = getattr(p, 'on_order', 0) or 0
+            building = getattr(p, 'quantity_being_built', 0) or 0
+            gap = orderflow._uncovered(p, need)
+            rows.append({
+                'part': p, 'need': need, 'spec': spec,
+                'img': p.image.url if p.image else '',
+                'stock': stock, 'on_order': on_order,
+                'building': building, 'gap': gap,
+                'supplier': str(sp.supplier.name) if sp else '',
+                'sku': (sp.SKU or '') if sp else '',
+                'price': price, 'lead': lead,
+                'pos': pos, 'bos': bos,
+                'attachments': [
+                    {'name': a.basename or a.link or '附件',
+                     'url': a.attachment.url if a.attachment
+                     else (a.link or '')}
+                    for a in p.attachments.all()[:3]
+                    if getattr(a, 'attachment', None)
+                    or getattr(a, 'link', None)]})
+        ctx = {'part': part, 'qty': qty, 'rows': rows}
+        return self._render(request, 'part_table.html', ctx)
 
     # ---------- 排单看板 ----------
 
@@ -1324,12 +1461,12 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
         js = (
             'export function getFeature(args) {\n'
             '  if (args && args.serverContext && args.serverContext.url) {\n'
-            '    window.location.href = args.serverContext.url;\n'
+            '    window.open(args.serverContext.url, "_blank");\n'
             '  }\n'
             '}\n'
             'export function executeAction(args) {\n'
             '  var u = args && args.context && args.context.url;\n'
-            '  if (u) { window.location.href = u; }\n'
+            '  if (u) { window.open(u, "_blank"); }\n'
             '}\n'
             "function linkBtn(url, title, desc) {\n"
             "  return '<a href=\"' + url + '\" style=\"display:block;"
@@ -1411,6 +1548,56 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             "      + '</a>';\n"
             "  }\n"
             "  target.innerHTML = html + '</div>';\n"
+            "}\n"
+            "export function renderPartTablePanel(target, ctx) {\n"
+            "  if (!target) { return; }\n"
+            "  var c = (ctx && ctx.context) || {};\n"
+            "  var rows = c.rows || [];\n"
+            "  var esc = function (s) { return String(s == null ? '' : s)\n"
+            "    .replace(/&/g,'&amp;').replace(/</g,'&lt;'); };\n"
+            "  var num = function (s) { var n = parseFloat(s);\n"
+            "    return isNaN(n) ? '0' : String(Math.round(n * 100) / 100); };\n"
+            "  if (!rows.length) {\n"
+            "    target.innerHTML = '<div style=\"color:#888\">无BOM明细</div>';\n"
+            "    return;\n"
+            "  }\n"
+            "  var th = 'border:1px solid #e2e2e2;padding:5px 8px;"
+            "background:#f6f8fa;text-align:left;white-space:nowrap';\n"
+            "  var td = 'border:1px solid #e2e2e2;padding:5px 8px';\n"
+            "  var html = '<div style=\"overflow-x:auto\">'\n"
+            "    + '<table style=\"border-collapse:collapse;font-size:13px;"
+            "width:100%\">'\n"
+            "    + '<tr><th style=\"' + th + '\">IPN</th>'\n"
+            "    + '<th style=\"' + th + '\">名称</th>'\n"
+            "    + '<th style=\"' + th + '\">需求</th>'\n"
+            "    + '<th style=\"' + th + '\">库存</th>'\n"
+            "    + '<th style=\"' + th + '\">在途</th>'\n"
+            "    + '<th style=\"' + th + '\">缺口</th></tr>';\n"
+            "  for (var i = 0; i < rows.length; i++) {\n"
+            "    var r = rows[i];\n"
+            "    var gap = parseFloat(r.gap) || 0;\n"
+            "    html += '<tr' + (gap > 0 ? ' style=\"background:#fff8f8\"' : '')\n"
+            "      + '>'\n"
+            "      + '<td style=\"' + td + ';font-family:monospace\">'\n"
+            "      + esc(r.ipn || '—') + '</td>'\n"
+            "      + '<td style=\"' + td + '\"><a href=\"/web/part/' + r.pk\n"
+            "      + '/\" style=\"color:#2f6feb;text-decoration:none\">'\n"
+            "      + esc(r.name) + '</a></td>'\n"
+            "      + '<td style=\"' + td + '\">' + num(r.need) + '</td>'\n"
+            "      + '<td style=\"' + td + '\">' + num(r.stock) + '</td>'\n"
+            "      + '<td style=\"' + td + '\">' + num(r.on_order) + '</td>'\n"
+            "      + '<td style=\"' + td + '\">'\n"
+            "      + (gap > 0 ? '<b style=\"color:#b3261e\">' + num(r.gap)\n"
+            "        + '</b>' : '<span style=\"color:#2b8a3e\">0</span>')\n"
+            "      + '</td></tr>';\n"
+            "  }\n"
+            "  html += '</table></div>';\n"
+            "  if (c.full_url) {\n"
+            "    html += '<p style=\"margin-top:8px\"><a href=\"' + c.full_url\n"
+            "      + '\" target=\"_blank\" style=\"color:#2f6feb\">'\n"
+            "      + '打开完整物料总表 →</a></p>';\n"
+            "  }\n"
+            "  target.innerHTML = html;\n"
             "}\n")
         resp = HttpResponse(js, content_type='application/javascript')
         resp['Cache-Control'] = 'no-cache'
