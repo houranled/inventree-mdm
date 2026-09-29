@@ -807,6 +807,15 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             'name': '销售通知组',
             'description': '销售订单齐套时通知的 Django 用户组名',
             'default': '销售'},
+        'OF_GROUP_PUR': {
+            'name': '采购通知组',
+            'description': '自动生成采购单待确认时通知的 Django 用户组名',
+            'default': '采购'},
+        'OF_AUTO_PO_SCAN': {
+            'name': '每日缺料巡检',
+            'description': '每日扫描全局缺料，按供应商自动生成 PENDING '
+                           '采购单并通知采购组（幂等，不重复建单）',
+            'validator': bool, 'default': False},
         'OF_BUILD_DAYS': {
             'name': '默认生产周期(天)',
             'description': 'part.metadata 无 lead_time_days 时的自制周期兜底值',
@@ -838,6 +847,7 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
 
     SCHEDULED_TASKS = {
         'daily_recalc': {'func': 'task_daily_recalc', 'schedule': 'D'},
+        'daily_scan': {'func': 'task_daily_scan', 'schedule': 'D'},
     }
 
     def task_daily_recalc(self, *args, **kwargs):
@@ -846,6 +856,15 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             return
         import orderflow
         orderflow.daily_recalc(self)
+
+    def task_daily_scan(self, *args, **kwargs):
+        """每日缺料巡检：全局缺口 → 自动生成 PENDING 采购单。"""
+        if not self.get_setting('OF_ENABLE'):
+            return
+        if not self.get_setting('OF_AUTO_PO_SCAN'):
+            return
+        import orderflow
+        orderflow.auto_shortage_scan(self)
 
     # ---------------- 事件分发（EventMixin） ----------------
 

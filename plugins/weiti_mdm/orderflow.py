@@ -339,7 +339,7 @@ def _create_build(part, qty, source_order, need_by):
     return Build.objects.create(
         part=part,
         quantity=qty,
-        title='由 %s 自动生成' % source_order.reference,
+        title='由 %s 自动生成' % _src_ref(source_order),
         parent=source_order if is_build_src else None,
         sales_order=(source_order.sales_order if is_build_src
                      else source_order
@@ -374,11 +374,15 @@ def _create_po_lines(plugin, items, source_order, need_by):
                                            'lines': []})['lines'].append(
             (sp, part, qty, price))
     created = []
-    src_kind = source_order.__class__.__name__
+    src_kind = source_order.__class__.__name__ if source_order else ''
     tpl = _SRC_URLS.get(src_kind, '')
     src_url = tpl % source_order.pk if tpl else ''
-    src_ref = _src_ref(source_order)
+    src_ref = _src_ref(source_order) if source_order else '缺料巡检'
     for g in groups.values():
+        md = {}
+        if source_order is not None:
+            md[META_SRC] = _src_tag(source_order)
+            md[META_ROOT] = _src_tag(_root_source(source_order))
         po = PurchaseOrder.objects.create(
             supplier=g['supplier'],
             description='自动生成：为 %s 采购缺料' % src_ref,
@@ -386,8 +390,7 @@ def _create_po_lines(plugin, items, source_order, need_by):
             responsible=_responsible_of(source_order),
             target_date=need_by,
             project_code=getattr(source_order, 'project_code', None),
-            metadata={META_SRC: '%s:%s' % (src_kind, source_order.pk),
-                      META_ROOT: _src_tag(_root_source(source_order))})
+            metadata=md)
         for sp, part, qty, price in g['lines']:
             PurchaseOrderLineItem.objects.create(
                 order=po, part=sp, quantity=qty,
@@ -398,6 +401,12 @@ def _create_po_lines(plugin, items, source_order, need_by):
         created.append(po)
         logger.info('WeiTiMDM: 自动生成采购单 %s (%d 行, 来源 %s)',
                     po.reference, len(g['lines']), src_ref)
+    if created:
+        try:
+            import weiti_notify
+            weiti_notify.notify_new_orders(plugin, source_order, created)
+        except Exception:
+            logger.exception('WeiTiMDM: 采购单建单通知发送失败')
     return created
 
 
@@ -432,6 +441,12 @@ def on_sales_order_issued(plugin, so):
             _create_po_lines(plugin, to_buy, so, so.target_date)
         except Exception:
             logger.exception('WeiTiMDM: 为 %s 建采购单失败', so.reference)
+    if to_build:
+        try:
+            import weiti_notify
+            weiti_notify.notify_new_orders(plugin, so, to_build)
+        except Exception:
+            logger.exception('WeiTiMDM: 生产单建单通知发送失败')
     return to_build
 
 
@@ -470,6 +485,12 @@ def on_build_issued(plugin, build):
             _create_po_lines(plugin, to_buy, build, build.target_date)
         except Exception:
             logger.exception('WeiTiMDM: 为 %s 建采购单失败', build.reference)
+    if to_build:
+        try:
+            import weiti_notify
+            weiti_notify.notify_new_orders(plugin, build, to_build)
+        except Exception:
+            logger.exception('WeiTiMDM: 子生产单建单通知发送失败')
     return to_build
 
 
@@ -658,6 +679,32 @@ def daily_recalc(plugin):
     except Exception:
         logger.exception('WeiTiMDM: 优先级重算失败')
     recheck_open_orders(plugin)
+
+
+def auto_shortage_scan(plugin):
+    """每日缺料巡检：全局缺口 → 按供应商生成 PENDING 采购单。
+
+    幂等：本次建的 PO 计入 on_order，下次巡检缺口归零，不会重复建单。
+    只处理 purchaseable 且有供应商零件的叶子件；无供应商的行记日志跳过。
+    """
+    to_buy = []
+    earliest = []
+    for r in collect_shortages():
+        p = r['part']
+        if r['gap'] <= 0:
+            continue
+        if not getattr(p, 'purchaseable', False):
+            logger.info('WeiTiMDM: 巡检跳过 %s（缺口 %s，不可采购）',
+                        p.IPN or p.name, r['gap'])
+            continue
+        to_buy.append({'part': p, 'qty': r['gap']})
+        if r.get('earliest'):
+            earliest.append(r['earliest'])
+    if not to_buy:
+        return
+    need_by = min(earliest) if earliest else _today()
+    pos = _create_po_lines(plugin, to_buy, None, need_by)
+    logger.info('WeiTiMDM: 缺料巡检生成 %d 张采购单', len(pos))
 
 
 # ------------------------------------------------------------------

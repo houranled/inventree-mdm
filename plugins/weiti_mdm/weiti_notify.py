@@ -129,8 +129,43 @@ def notify_kitted(plugin, order, kind):
     logger.info('WeiTiMDM: %s 齐套通知已发 (收件 %d 人)', ref, len(users))
 
 
-def notify_shortage_created(plugin, order, created, kind):
-    """自动生成下游订单时知会（可选，先静默只记日志）。"""
-    for obj in created:
-        logger.info('WeiTiMDM: %s %s → 自动生成 %s',
-                    kind, order.reference, getattr(obj, 'reference', ''))
+def notify_new_orders(plugin, source, created):
+    """自动生成的下游订单 → 按类型分组通知：PO→采购组，BO→生产组。
+
+    source 可为 None（定时巡检）或 Part（按BOM采购页手动触发）。
+    """
+    if not created:
+        return
+    pos = [o for o in created
+           if o.__class__.__name__ == 'PurchaseOrder']
+    bos = [o for o in created if o.__class__.__name__ == 'Build']
+    if pos:
+        _notify_created(plugin, source, pos, 'OF_GROUP_PUR', '采购单')
+    if bos:
+        _notify_created(plugin, source, bos, 'OF_GROUP_PROD', '生产单')
+
+
+def _notify_created(plugin, source, orders, group_key, label):
+    src = (getattr(source, 'reference', None)
+           or getattr(source, 'IPN', None)
+           or ('缺料巡检' if source is None else str(source)))
+    users = collect_recipients(plugin, source, group_key)
+    n = len(orders)
+    refs = '、'.join(getattr(o, 'reference', str(o.pk)) for o in orders)
+    title = '自动生成 %d 张%s待确认' % (n, label)
+    msg = '来源：%s；单号：%s' % (src, refs)
+    target = orders[0] if orders else source
+    send_inapp(target, users, title, msg)
+    base = _site_base(plugin)
+    lines = ['### %s' % title, '> 来源：**%s**' % src]
+    for o in orders:
+        sup = getattr(getattr(o, 'supplier', None), 'name', '')
+        ln = '- **%s**%s' % (
+            o.reference, '（%s）' % sup if sup else '')
+        if base:
+            ln += ' [查看](%s%s)' % (base, _order_url(o))
+        lines.append(ln)
+    lines.append('> 请核对后下达。')
+    send_wecom(plugin, '\n'.join(lines))
+    logger.info('WeiTiMDM: %s → 自动建单通知已发 %s (收件 %d 人)',
+                src, refs, len(users))
