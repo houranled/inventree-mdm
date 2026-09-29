@@ -801,6 +801,10 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                  name='bom-export-multi'),
             path('supplier-import/', self.view_supplier_import,
                  name='supplier-import'),
+            path('dashboard.js', self.view_dashboard_js,
+                 name='dashboard-js'),
+            path('pending-parts/', self.view_pending_parts,
+                 name='pending-parts'),
         ]
 
     # ---------- 零件详情页"BOM导入"按钮（primary_action UI 特性） ----------
@@ -859,32 +863,157 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin,
                 })
         return actions
 
-    # ---------- 左侧导航注入（navigation UI 特性） ----------
+    # ---------- Spotlight 动作（Ctrl+K 搜索 → 整页跳插件页） ----------
+    # 注意：navigation 特性的 options.url 只支持 SPA 内部路由，指向插件
+    # Django 页面会被前端拼成 /web/plugin/... 而 404，故不用 navigation。
 
-    def get_ui_navigation_items(self, request, context, **kwargs):
-        """在 PUI 原生导航里加一个「BOM导入」入口，点击整页跳插件页。"""
+    def get_ui_spotlight_actions(self, request, context, **kwargs):
+        """Spotlight 动作：executeAction 里 window.location.href 整页跳。"""
         if not (request.user and request.user.is_staff):
             return []
+        src = '/plugin/weiti_mdm/bom-import.js'
         return [{
-            'key': 'weiti-bom-import-nav',
+            'key': 'weiti-bom-import-action',
             'title': 'BOM导入',
+            'description': '上传 BOM 文件：自动建零件、挂 BOM、导图片',
             'icon': 'ti:list-plus:outline',
-            'options': {'url': '/plugin/weiti_mdm/bom-import/'},
+            'context': {'url': '/plugin/weiti_mdm/bom-import/'},
+            'source': src,
         }, {
-            'key': 'weiti-supplier-import-nav',
+            'key': 'weiti-supplier-import-action',
             'title': '供应商导入',
+            'description': '零件关联供应商/制造商/SKU/价格',
             'icon': 'ti:building-store:outline',
-            'options': {'url': '/plugin/weiti_mdm/supplier-import/'},
+            'context': {'url': '/plugin/weiti_mdm/supplier-import/'},
+            'source': src,
+        }, {
+            'key': 'weiti-pending-parts-action',
+            'title': '待完善编码零件',
+            'description': '查看 IPN 以 ! 开头、参数待补齐的零件',
+            'icon': 'ti:alert-circle:outline',
+            'context': {'url': '/plugin/weiti_mdm/pending-parts/'},
+            'source': src,
         }]
 
+    # ---------- 首页 Dashboard 卡片 ----------
+
+    def get_ui_dashboard_items(self, request, context, **kwargs):
+        """仪表盘卡片：工具入口 + 待完善编码计数。"""
+        if not (request.user and request.user.is_staff):
+            return []
+        pending = 0
+        try:
+            from part.models import Part
+            pending = Part.objects.filter(IPN__startswith='!').count()
+        except Exception:
+            pass
+        src = '/plugin/weiti_mdm/dashboard.js'
+        pending_url = '/plugin/weiti_mdm/pending-parts/'
+        return [{
+            'key': 'weiti-mdm-tools',
+            'title': '物料工具',
+            'description': 'BOM / 供应商导入入口',
+            'icon': 'ti:tools:outline',
+            'options': {'width': 2, 'height': 1},
+            'context': {
+                'bom_url': '/plugin/weiti_mdm/bom-import/',
+                'sup_url': '/plugin/weiti_mdm/supplier-import/',
+                'pending_url': pending_url},
+            'source': f'{src}:renderToolsCard',
+        }, {
+            'key': 'weiti-pending-count',
+            'title': '待完善编码',
+            'description': 'IPN 以 ! 开头的零件数量',
+            'icon': 'ti:alert-circle:outline',
+            'options': {'width': 1, 'height': 1},
+            'context': {'count': pending, 'pending_url': pending_url},
+            'source': f'{src}:renderPendingCard',
+        }]
+
+    # ---------- 待完善 IPN 零件清单页 ----------
+
+    def view_pending_parts(self, request):
+        """IPN 以 ! 开头的零件清单：IPN/名称/类别/参数填写进度。"""
+        from django.http import HttpResponseForbidden
+        if not (request.user.is_authenticated and request.user.is_staff):
+            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        from part.models import Part
+        rows = []
+        for p in (Part.objects.filter(IPN__startswith='!')
+                  .select_related('category').order_by('IPN', 'name')):
+            try:
+                ps = list(p.parameters.all())
+                filled = sum(1 for x in ps if str(x.data or '').strip())
+                prog = f'{filled}/{len(ps)}'
+            except Exception:
+                prog = '—'
+            rows.append({
+                'pk': p.pk, 'ipn': p.IPN, 'name': p.name,
+                'cat': p.category.name if p.category else '',
+                'prog': prog})
+        ctx = {'plugin': self, 'parts': rows}
+        return self._render(request, 'pending_parts.html', ctx)
+
     def view_bom_js(self, request):
-        """BOM导入/导出按钮的点击处理 JS（整页跳转，非 SPA navigate）。"""
+        """按钮/Spotlight 动作的 JS（整页跳转，非 SPA navigate）。
+
+        getFeature:     详情页按钮，feature.context 作为 args.serverContext
+        executeAction:  Spotlight 动作，feature.context 作为 args.context
+        """
         from django.http import HttpResponse
         js = ('export function getFeature(args) {\n'
               '  if (args && args.serverContext && args.serverContext.url) {\n'
               '    window.location.href = args.serverContext.url;\n'
               '  }\n'
+              '}\n'
+              'export function executeAction(args) {\n'
+              '  var u = args && args.context && args.context.url;\n'
+              '  if (u) { window.location.href = u; }\n'
               '}\n')
+        return HttpResponse(js, content_type='application/javascript')
+
+    def view_dashboard_js(self, request):
+        """Dashboard 卡片的渲染 JS。
+
+        两参函数走前端 legacy DOM 路径：fn(target, ctx)，
+        feature.context 位于 ctx.context。裸 JS（无 JSX 转译）。
+        """
+        from django.http import HttpResponse
+        js = (
+            "function linkBtn(url, title, desc) {\n"
+            "  return '<a href=\"' + url + '\" style=\"display:block;"
+            "padding:10px 12px;border:1px solid #dee2e6;border-radius:8px;"
+            "text-decoration:none;color:inherit\">'\n"
+            "    + '<b>' + title + '</b>'\n"
+            "    + '<div style=\"color:#888;font-size:12px;margin-top:2px\">'\n"
+            "    + desc + '</div></a>';\n"
+            "}\n"
+            "export function renderToolsCard(target, ctx) {\n"
+            "  if (!target) { return; }\n"
+            "  var c = (ctx && ctx.context) || {};\n"
+            "  target.innerHTML ="
+            " '<div style=\"display:flex;flex-direction:column;gap:8px\">'\n"
+            "    + linkBtn(c.bom_url, 'BOM 导入',\n"
+            "        '上传 Excel/CSV：建零件、挂 BOM、导图片')\n"
+            "    + linkBtn(c.sup_url, '供应商导入',\n"
+            "        '零件关联供应商 / 制造商 / SKU / 价格')\n"
+            "    + linkBtn(c.pending_url, '待完善编码',\n"
+            "        'IPN 以 ! 开头的零件清单')\n"
+            "    + '</div>';\n"
+            "}\n"
+            "export function renderPendingCard(target, ctx) {\n"
+            "  if (!target) { return; }\n"
+            "  var c = (ctx && ctx.context) || {};\n"
+            "  var n = (c.count == null) ? '?' : c.count;\n"
+            "  target.innerHTML ="
+            " '<a href=\"' + c.pending_url + '\" style=\"text-decoration:none;"
+            "color:inherit;display:flex;flex-direction:column;"
+            "align-items:center;gap:6px;padding:8px\">'\n"
+            "    + '<span style=\"font-size:38px;font-weight:700;"
+            "line-height:1\">' + n + '</span>'\n"
+            "    + '<span style=\"color:#888;font-size:13px\">'"
+            "个零件待完善编码，点击查看清单</span></a>';\n"
+            "}\n")
         return HttpResponse(js, content_type='application/javascript')
 
     @staticmethod
