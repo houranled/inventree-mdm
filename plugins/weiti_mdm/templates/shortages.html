@@ -60,6 +60,8 @@
         {% for pk, ref in r.bos %}
           <a class="plain"
             href="/web/manufacturing/build-order/{{ pk }}/">{{ ref }}</a>
+          <a class="plain" href="/plugin/weiti_mdm/build-table/{{ pk }}/"
+            style="color:#0b8a5b" title="物料穿透">物料</a>
         {% endfor %}
       </td>
       <td class="num">
@@ -72,6 +74,10 @@
         {% for d in r.demands %}
           <div class="d">
             <a class="plain" href="{{ d.url }}">{{ d.ref }}</a>
+            {% if d.table_url %}
+              <a class="plain" href="{{ d.table_url }}"
+                style="color:#0b8a5b" title="查看该生产单物料穿透">物料</a>
+            {% endif %}
             ×{{ d.qty|floatformat:"-2" }}
             {% if d.date %}<span class="late">{{ d.date }}</span>{% endif %}
             {% if d.root_ref %}

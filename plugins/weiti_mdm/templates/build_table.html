@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>物料穿透 — {{ bo.reference }}</title>
+  <style>
+    body { font-family: system-ui, "Microsoft YaHei", sans-serif;
+           max-width: 1400px; margin: 32px auto; padding: 0 16px;
+           color: #222; }
+    h1 { font-size: 20px; }
+    .hint { color: #888; font-size: 13px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px;
+            font-size: 13px; }
+    th, td { border: 1px solid #e2e2e2; padding: 6px 8px;
+             text-align: left; vertical-align: middle; }
+    th { background: #f6f8fa; white-space: nowrap; }
+    .ipn { font-family: ui-monospace, monospace; }
+    .num { text-align: right; }
+    .gap { color: #b3261e; font-weight: 700; }
+    .ok { color: #2b8a3e; }
+    tr.asm td { background: #f2f6ff; }
+    tr.short td { background: #fff8f8; }
+    img.thumb { max-width: 40px; max-height: 40px; display: block; }
+    a.plain { color: #2f6feb; text-decoration: none; }
+    .po { margin: 2px 0; }
+    .badge { display: inline-block; padding: 1px 7px; border-radius: 9px;
+             font-size: 12px; background: #eef1f5; color: #333; }
+    .tag-asm { display: inline-block; padding: 0 6px; border-radius: 3px;
+               font-size: 11px; background: #dbe7ff; color: #1c4db3;
+               margin-left: 4px; }
+    .tag-leaf { display: inline-block; padding: 0 6px; border-radius: 3px;
+                font-size: 11px; background: #e4f5ea; color: #1c7a3f;
+                margin-left: 4px; }
+    .nopo { color: #b3261e; font-size: 12px; }
+    .actlink { color: #b3261e; font-weight: 700; font-size: 12px;
+               text-decoration: none; }
+    .actbtn { padding: 2px 10px; font-size: 12px; cursor: pointer;
+              color: #fff; background: #0b8a5b; border: none;
+              border-radius: 3px; margin-top: 3px; }
+    .d0 { padding-left: 4px; }
+    .d1 { padding-left: 24px; }
+    .d2 { padding-left: 44px; }
+    .d3 { padding-left: 64px; }
+    .d4 { padding-left: 84px; }
+    .d5 { padding-left: 104px; }
+    .d6 { padding-left: 124px; }
+    .d7 { padding-left: 144px; }
+    .d8 { padding-left: 164px; }
+  </style>
+</head>
+<body>
+  <h1>物料穿透 — {{ bo.reference }}
+    <span class="hint">{{ bo.quantity }} × {{ bo.part.IPN }}
+      {{ bo.part.name }}</span></h1>
+  {% if upstream %}
+  <p class="hint" style="color:#444">上游：
+    {% for u in upstream %}
+      {{ u.label }}
+      <a class="plain" href="{{ u.url }}">{{ u.ref }}</a>{% if not forloop.last %} · {% endif %}
+    {% endfor %}
+  </p>
+  {% endif %}
+  <p class="hint">按 BOM 逐层展开到叶子件（缩进表示父子层级，
+    <span class="tag-asm">装配</span> 为半成品/子装配）。
+    缺口 = 所需 − 库存 − 关联本单的下游供给（叶子=采购在途，
+    装配=子生产单在产；<strong>其它订单的在途/在产不计入本单
+    供给</strong>）。关联订单列：装配行挂子生产单、叶子行挂
+    采购单（单号 · 状态 · 数量 · 供应商/齐套）。</p>
+
+  {% if rows %}
+  <table>
+    <tr>
+      <th>层级 / 名称</th><th>IPN</th>
+      <th class="num">所需</th>
+      <th class="num">可用库存</th>
+      <th>关联订单（子生产单 / 采购单 · 状态 · 数量 · 供应商/齐套）</th>
+      <th class="num">缺口</th>
+    </tr>
+    {% for r in rows %}
+    <tr class="{% if r.is_assembly %}asm{% elif r.gap > 0 and not r.polines %}short{% endif %}">
+      <td class="d{{ r.d }}">
+        {% if r.img %}<img class="thumb" src="{{ r.img }}"
+          style="display:inline-block;vertical-align:middle">{% endif %}
+        <a class="plain"
+          href="/web/part/{{ r.part.pk }}/">{{ r.part.name }}</a>
+        {% if r.is_assembly %}<span class="tag-asm">装配</span>
+        {% endif %}
+      </td>
+      <td class="ipn">{{ r.part.IPN|default:"—" }}</td>
+      <td class="num">{{ r.need|floatformat:"-2" }}</td>
+      <td class="num">{{ r.stock|floatformat:"-2" }}</td>
+      <td>
+        {% if r.is_assembly %}
+          {% for cb in r.child_bos %}
+            <div class="po">
+              <a class="plain"
+                href="/web/manufacturing/build-order/{{ cb.pk }}/">{{ cb.ref }}</a>
+              · <span class="badge">{{ cb.status }}</span>
+              · {{ cb.qty|floatformat:"-2" }}
+              {% if cb.kitted %}· <span class="ok">齐套</span>
+              {% else %}· <span class="gap">缺料</span>{% endif %}
+            </div>
+          {% empty %}
+            <span class="hint">未建子生产单（下层叶子件直接挂本单采购）</span>
+          {% endfor %}
+          {% if r.gap > 0 %}
+            <form method="post" style="display:inline"
+              action="/plugin/weiti_mdm/build-table/{{ bo.pk }}/spawn/{{ r.part.pk }}/">
+              {% csrf_token %}
+              <input type="hidden" name="qty"
+                value="{{ r.gap|floatformat:"-2" }}">
+              <button type="submit" class="actbtn">建子生产单</button>
+            </form>
+          {% endif %}
+        {% else %}
+          {% for po in r.polines %}
+            <div class="po">
+              <a class="plain"
+                href="/web/purchasing/purchase-order/{{ po.pk }}/">{{ po.ref }}</a>
+              · <span class="badge">{{ po.status }}</span>
+              · {{ po.qty|floatformat:"-2" }}/{{ po.received|floatformat:"-2" }}
+              · {% if po.price %}{{ po.price }}{% else %}—{% endif %}
+              · {{ po.supplier|default:"—" }}
+            </div>
+          {% empty %}
+            <span class="hint">无关联采购单</span>
+          {% endfor %}
+          {% if r.gap > 0 %}
+            <div class="po"><a class="actlink" target="_blank"
+              href="/plugin/weiti_mdm/part-po/{{ r.part.pk }}/?qty={{ r.gap|floatformat:"-2" }}&bo={{ bo.pk }}">→ 去采购</a></div>
+          {% endif %}
+        {% endif %}
+      </td>
+      <td class="num">
+        {% if r.gap > 0 %}<span class="gap">{{ r.gap|floatformat:"-2" }}</span>
+        {% else %}<span class="ok">0</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+    <p class="hint" style="margin-top:16px">该生产单的产出零件没有 BOM 明细。</p>
+  {% endif %}
+
+  <p style="margin-top:20px">
+    <a class="plain"
+      href="/web/manufacturing/build-order/{{ bo.pk }}/">← 返回生产单</a> ·
+    <a class="plain"
+      href="/plugin/weiti_mdm/trace/build/{{ bo.pk }}/">订单穿透</a> ·
+    <a class="plain" href="/plugin/weiti_mdm/shortages/">缺料总览</a>
+  </p>
+</body>
+</html>

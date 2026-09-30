@@ -26,12 +26,20 @@
 </head>
 <body>
   <h1>按BOM生成采购单 — {{ part.IPN }} {{ part.name }}</h1>
+  {% if src_bo %}
+  <p class="hint" style="color:#b3261e">来源生产单
+    <a class="plain"
+      href="/web/manufacturing/build-order/{{ src_bo.pk }}/">{{ src_bo.reference }}</a>
+    —— 本页生成的采购单将关联到该生产单及其最上游归属。</p>
+  {% endif %}
   <p class="hint">逐层下钻到最底层可采购件。
     全局净额口径：供给池（库存+在途+在产）先扣除其它开放订单已承诺的需求，
     再算本单净缺口；<span style="color:#b3261e">「已承诺」</span>标记的在途
     不可当作本单可用供给。供应商默认取按缺口数量的最低价，可改选。</p>
 
   <form method="get">
+    {% if src_bo %}<input type="hidden" name="bo"
+      value="{{ src_bo.pk }}">{% endif %}
     生产/备货数量：<input type="number" name="qty" min="1" step="1"
       value="{{ qty }}">
     <button type="submit">重算预览</button>
@@ -57,6 +65,8 @@
   <h3>需采购（{{ buy|length }} 项）</h3>
   <form method="post">{% csrf_token %}
     <input type="hidden" name="qty" value="{{ qty }}">
+    {% if src_bo %}<input type="hidden" name="bo"
+      value="{{ src_bo.pk }}">{% endif %}
     <input type="hidden" name="action" value="create">
     <table>
       <tr><th>IPN</th><th>名称</th><th class="num">需求</th>
@@ -156,6 +166,9 @@
 
   <p style="margin-top:20px">
     <a class="plain" href="/web/part/{{ part.pk }}/">← 返回零件</a> ·
+    {% if src_bo %}<a class="plain"
+      href="/plugin/weiti_mdm/build-table/{{ src_bo.pk }}/">返回物料穿透</a> ·
+    {% endif %}
     <a class="plain" href="/plugin/weiti_mdm/schedule/">排单看板</a>
   </p>
 

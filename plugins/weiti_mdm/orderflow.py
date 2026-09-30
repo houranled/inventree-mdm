@@ -764,6 +764,10 @@ def collect_bom_leaves(part, qty):
 
     返回 [{'part', 'need'}]，need 已按单层用量 × qty × 层级系数聚合。
     """
+    # 无 BOM 的叶子件：自身即最底层需求（单件采购场景）
+    if not part.bom_items.exists():
+        return [{'part': part, 'need': Decimal(str(qty)), 'usage': ''}]
+
     agg = {}
 
     def walk(p, factor, path):
@@ -899,6 +903,8 @@ def collect_shortages():
         e['need'] += qty
         d = {'kind': kind, 'pk': pk, 'ref': ref, 'qty': qty, 'date': date,
              'url': _SRC_URLS.get(kind, '') % pk if kind in _SRC_URLS else ''}
+        if kind == 'Build':
+            d['table_url'] = '/plugin/weiti_mdm/build-table/%s/' % pk
         # 需求的最上游归属（如 BO 需求归属 SO-0012），与直接来源相同则不标
         if (root is not None
                 and (root.__class__.__name__, root.pk) != (kind, pk)):

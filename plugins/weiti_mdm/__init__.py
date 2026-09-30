@@ -946,6 +946,10 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                  name='part-po'),
             path('part-table/<int:pk>/', self.view_part_table,
                  name='part-table'),
+            path('build-table/<int:pk>/', self.view_build_table,
+                 name='build-table'),
+            path('build-table/<int:pk>/spawn/<int:ppk>/',
+                 self.view_build_spawn, name='build-spawn'),
             path('shortages/', self.view_shortages,
                  name='shortages'),
             path('trace/<str:kind>/<int:pk>/', self.view_trace,
@@ -968,15 +972,28 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             kmap = {'sales-order': 'salesorder',
                     'build-order': 'build',
                     'purchase-order': 'purchaseorder'}
-            return [{
-                'key': 'weiti-order-trace',
-                'title': '订单穿透',
-                'icon': 'ti:binary-tree:outline',
-                'options': {'color': 'violet'},
-                'context': {'url': '/plugin/weiti_mdm/trace/%s/%s/' % (
-                    kmap[mo.group(1)], mo.group(2))},
-                'source': '/plugin/weiti_mdm/bom-import.js',
-            }]
+            if mo.group(1) == 'build-order':
+                # 物料穿透已融合订单穿透（上游链 + BOM树挂子BO/PO）
+                oactions = [{
+                    'key': 'weiti-build-table',
+                    'title': '物料穿透',
+                    'icon': 'ti:list-details:outline',
+                    'options': {'color': 'teal'},
+                    'context': {'url': '/plugin/weiti_mdm/build-table/%s/'
+                                % mo.group(2)},
+                    'source': '/plugin/weiti_mdm/bom-import.js',
+                }]
+            else:
+                oactions = [{
+                    'key': 'weiti-order-trace',
+                    'title': '订单穿透',
+                    'icon': 'ti:binary-tree:outline',
+                    'options': {'color': 'violet'},
+                    'context': {'url': '/plugin/weiti_mdm/trace/%s/%s/' % (
+                        kmap[mo.group(1)], mo.group(2))},
+                    'source': '/plugin/weiti_mdm/bom-import.js',
+                }]
+            return oactions
         m = re.search(r'/part/(\d+)', str(context.get('location', '')))
         if not m:
             return []
@@ -1336,6 +1353,17 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                     or request.GET.get('qty') or '1')
         except Exception:
             qty = D('1')
+
+        # bo=<pk>：从物料穿透页"去采购"进入，生成的 PO 关联该生产单
+        from build.models import Build
+        src_bo = None
+        bo_pk = request.POST.get('bo') or request.GET.get('bo')
+        if bo_pk:
+            try:
+                src_bo = Build.objects.get(pk=bo_pk)
+            except (Build.DoesNotExist, ValueError):
+                src_bo = None
+
         created = None
         if request.method == 'POST' and request.POST.get('action') == 'create':
             buy0, _ = orderflow.collect_bom_purchasables(
@@ -1349,7 +1377,13 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                         e['sp'] = SupplierPart.objects.get(pk=sp_pk)
                     except SupplierPart.DoesNotExist:
                         pass
-            created = orderflow.create_pos_for_part(self, buy0, part)
+            if src_bo:
+                created = orderflow._create_po_lines(
+                    self, buy0, src_bo,
+                    getattr(src_bo, 'target_date', None)
+                    or orderflow._today())
+            else:
+                created = orderflow.create_pos_for_part(self, buy0, part)
 
         # 展示态：建单后重新收集（刚建的 PO 计入在途，行自动移入跳过项）
         # net_open：供给池先偿还其它开放订单已承诺的需求，再算本单缺口
@@ -1373,7 +1407,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                                 status__in=BuildStatusGroups.ACTIVE_CODES)
                         .values_list('pk', 'reference'))
         ctx = {'part': part, 'qty': qty, 'buy': buy,
-               'skipped': skipped, 'created': created}
+               'skipped': skipped, 'created': created,
+               'src_bo': src_bo}
         return self._render(request, 'part_po.html', ctx)
 
     # ---------- 物料明细总表（摊平到叶子件） ----------
@@ -1466,6 +1501,170 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                     or getattr(a, 'link', None)]})
         ctx = {'part': part, 'qty': qty, 'rows': rows}
         return self._render(request, 'part_table.html', ctx)
+
+    # ---------- 生产单物料穿透（物料 + 关联订单） ----------
+
+    def view_build_table(self, request, pk):
+        """生产单物料树：递归展开 BOM 到叶子层（缩进表示父子），
+        叶子件挂关联本BO（含子孙BO）的采购单信息。"""
+        from django.http import HttpResponse, HttpResponseForbidden
+        from django.db.models import Q
+        from decimal import Decimal as D
+        from build.models import Build
+        from order.models import PurchaseOrder, PurchaseOrderLineItem
+        import orderflow
+
+        if not (request.user.is_authenticated and request.user.is_staff):
+            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        try:
+            bo = Build.objects.get(pk=pk)
+        except Build.DoesNotExist:
+            return HttpResponse('生产单不存在', status=404)
+
+        # 关联本BO（含子孙BO）的采购单集合
+        tag = 'Build:%s' % pk
+        q = Q(metadata__weiti_source=tag) | Q(metadata__weiti_root=tag)
+        try:
+            sub_tags = ['Build:%s' % b.pk
+                        for b in bo.get_descendants(include_self=True)]
+            q |= Q(metadata__weiti_source__in=sub_tags)
+        except Exception:
+            pass
+        linked_ids = set(PurchaseOrder.objects.filter(q)
+                         .values_list('pk', flat=True))
+
+        # 本 BO 衍生的子生产单（parent 外键或 weiti_source 溯源）
+        child_map = {}
+        try:
+            for cb in Build.objects.filter(
+                    Q(parent=bo)
+                    | Q(**{'metadata__%s' % orderflow.META_SRC: tag})):
+                child_map.setdefault(cb.part_id, []).append({
+                    'pk': cb.pk, 'ref': cb.reference,
+                    'qty': cb.quantity,
+                    'remain': (D(str(cb.quantity))
+                               - D(str(getattr(cb, 'completed', 0) or 0))),
+                    'status': (cb.get_status_display()
+                               if hasattr(cb, 'get_status_display') else ''),
+                    'kitted': (cb.metadata or {}).get(
+                        orderflow.META_KITTED)})
+        except Exception:
+            pass
+
+        def po_lines_for(part):
+            out = []
+            if not linked_ids:
+                return out
+            for li in (PurchaseOrderLineItem.objects
+                       .filter(part__part=part, order_id__in=linked_ids)
+                       .select_related('order', 'order__supplier')):
+                po = li.order
+                out.append({
+                    'pk': po.pk, 'ref': po.reference,
+                    'status': (po.get_status_display()
+                               if hasattr(po, 'get_status_display') else ''),
+                    'qty': li.quantity, 'received': li.received,
+                    'price': li.purchase_price,
+                    'supplier': (str(po.supplier.name)
+                                 if po.supplier else '')})
+            return out
+
+        rows = []
+
+        def walk(part, factor, depth, path):
+            for it in (part.bom_items
+                       .select_related('sub_part').all()):
+                sub = it.sub_part
+                if not sub or sub.pk in path:  # 防 BOM 环
+                    continue
+                need = D(str(it.quantity)) * factor
+                is_assembly = sub.bom_items.exists()
+                stock = sub.available_stock or 0
+                polines = [] if is_assembly else po_lines_for(sub)
+                cbos = child_map.get(sub.pk, []) if is_assembly else []
+                # 本BO视角缺口：只认库存 + 关联本BO的下游供给
+                #（叶子=关联PO未到货；装配=子BO未完成在产；
+                #  其它订单的在途/在产不算本单供给）
+                if is_assembly:
+                    linked_in = sum(c['remain'] for c in cbos)
+                else:
+                    linked_in = sum(
+                        D(str(l['qty'])) - D(str(l['received'] or 0))
+                        for l in polines)
+                gap = need - D(str(stock)) - linked_in
+                rows.append({
+                    'depth': depth, 'd': min(depth, 8),
+                    'part': sub, 'need': need,
+                    'is_assembly': is_assembly,
+                    'stock': stock,
+                    'gap': max(gap, D(0)),
+                    'img': sub.image.url if sub.image else '',
+                    'child_bos': cbos,
+                    'polines': polines})
+                if is_assembly:
+                    walk(sub, need, depth + 1, path | {sub.pk})
+
+        walk(bo.part, D(str(bo.quantity)), 0, {bo.part.pk})
+
+        # 上游来源链：直接来源 + 最上游归属（metadata），
+        # 元数据缺失时退回原生 parent / sales_order 外键
+        upstream = []
+        md = bo.metadata or {}
+        seen = set()
+        for key, label in (('weiti_source', '来源'),
+                           ('weiti_root', '最上游归属')):
+            tag = md.get(key)
+            obj = orderflow._resolve_tag(tag) if tag else None
+            if obj and tag not in seen:
+                seen.add(tag)
+                kind = obj.__class__.__name__
+                url = orderflow._SRC_URLS.get(kind, '')
+                upstream.append({
+                    'label': label, 'ref': orderflow._src_ref(obj),
+                    'url': url % obj.pk if url else ''})
+        if not upstream:
+            if bo.sales_order_id:
+                so = bo.sales_order
+                upstream.append({
+                    'label': '销售订单', 'ref': so.reference,
+                    'url': '/web/sales/sales-order/%s/' % so.pk})
+            if bo.parent_id:
+                upstream.append({
+                    'label': '父生产单', 'ref': bo.parent.reference,
+                    'url': '/web/manufacturing/build-order/%s/'
+                           % bo.parent_id})
+
+        ctx = {'bo': bo, 'rows': rows, 'upstream': upstream}
+        return self._render(request, 'build_table.html', ctx)
+
+    def view_build_spawn(self, request, pk, ppk):
+        """物料穿透页"建子生产单"：为缺料装配行建关联本BO的子BO。
+
+        子BO parent=本BO、weiti_source=Build:本BO；Build post_save
+        触发 task_check_build，子BO自身缺料继续级联建更下游单。
+        """
+        from decimal import Decimal as D
+        from django.http import HttpResponseForbidden
+        from django.shortcuts import redirect
+        if not (request.user.is_authenticated and request.user.is_staff):
+            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        if request.method != 'POST':
+            return redirect('/plugin/weiti_mdm/build-table/%s/' % pk)
+        from build.models import Build
+        from part.models import Part
+        import orderflow
+        bo = Build.objects.get(pk=pk)
+        sub = Part.objects.get(pk=ppk)
+        try:
+            qty = D(request.POST.get('qty') or '0')
+        except Exception:
+            qty = D(0)
+        if qty <= 0:
+            qty = D(1)
+        orderflow._create_build(
+            sub, qty, bo,
+            getattr(bo, 'target_date', None) or orderflow._today())
+        return redirect('/plugin/weiti_mdm/build-table/%s/' % pk)
 
     # ---------- 缺料总览 / 订单穿透 ----------
 
