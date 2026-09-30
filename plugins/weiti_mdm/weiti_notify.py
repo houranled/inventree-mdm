@@ -152,16 +152,16 @@ def _notify_created(plugin, source, orders, group_key, label):
     users = collect_recipients(plugin, source, group_key)
     n = len(orders)
     refs = '、'.join(getattr(o, 'reference', str(o.pk)) for o in orders)
-    # 子BO自动下达 → 文案报"已下达"；PENDING 的报"待确认"
-    state, tail = '待确认', '请核对后下达。'
+    # 子BO自动下达 → 文案报"已发布"；PENDING 的报"待确认"
+    state, tail = '待确认', '请核对后发布。'
     if label == '生产单':
         try:
             from build.status_codes import BuildStatus
             if all(o.status == BuildStatus.PRODUCTION for o in orders):
-                state, tail = '已下达', '已进入生产。'
+                state, tail = '已发布', '已进入生产。'
         except Exception:
             pass
-    title = '自动生成 %d 张 %s %s（来源：%s）' % (n, label, state, src)
+    title = '自动生成 %d 张 %s %s（来源：%s 发布操作）' % (n, label, state, src)
     msg = '单号：%s' % refs
     target = orders[0] if orders else source
     send_inapp(target, users, title, msg)

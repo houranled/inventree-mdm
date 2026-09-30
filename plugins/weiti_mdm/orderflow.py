@@ -518,12 +518,14 @@ def on_sales_order_issued(plugin, so):
 
 
 def on_build_issued(plugin, build):
-    """BO BOM 行缺料 → 外购件挂 PO；assembly 交给 Auto Create Builds
-    （未启用时本插件兜底建子 BO）。建单/下达/行变更任一时机均可调用。
+    """BO BOM 行缺料 → 只自动建子 BO（assembly 交给 Auto Create
+    Builds，未启用时本插件兜底）。可采购叶子件不再自动建 PO——
+    一律等物料透查页人工确认供应商后生成。
+    建单/下达/行变更任一时机均可调用。
 
     净额口径：已承诺给其它订单的在产/在途不算本单供给，
     避免"别人在产的料"被当成自由供给而漏建子单。"""
-    to_buy, to_build = [], []
+    to_build = []
     skip_assembly = _autocreate_active()
     committed = _committed_map()
     for line in build.build_lines.select_related(
@@ -550,12 +552,9 @@ def on_build_issued(plugin, build):
             except Exception:
                 logger.exception('WeiTiMDM: 为 %s 建子生产单失败', sub.name)
         elif ch == 'purchase':
-            to_buy.append({'part': sub, 'qty': gap})
-    if to_buy:
-        try:
-            _create_po_lines(plugin, to_buy, build, build.target_date)
-        except Exception:
-            logger.exception('WeiTiMDM: 为 %s 建采购单失败', build.reference)
+            # 叶子件 PO 一律等物料透查页人工确认（可选供应商）
+            logger.info('WeiTiMDM: %s 缺 %s × %s，待透查页人工确认采购',
+                        build.reference, sub.IPN or sub.name, gap)
     if to_build:
         try:
             import weiti_notify
