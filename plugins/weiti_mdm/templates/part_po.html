@@ -1,63 +1,61 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>按BOM生成采购单</title>
-  <style>
-    body { font-family: system-ui, "Microsoft YaHei", sans-serif;
-           max-width: 1100px; margin: 32px auto; padding: 0 16px; color: #222; }
-    h1 { font-size: 20px; }
-    h3 { font-size: 15px; margin-top: 20px; }
-    .hint { color: #888; font-size: 13px; }
-    table { border-collapse: collapse; width: 100%; margin-top: 12px;
-            font-size: 13px; }
-    th, td { border: 1px solid #e2e2e2; padding: 6px 8px; text-align: left; }
-    th { background: #f6f8fa; }
-    .ipn { font-family: ui-monospace, monospace; }
-    .bad { color: #b3261e; }
-    .num { text-align: right; }
-    a.plain { color: #2f6feb; text-decoration: none; }
-    input[type=number] { width: 80px; padding: 4px; }
-    select { padding: 3px; max-width: 220px; }
-    button { padding: 6px 18px; }
-    #total { font-weight: 700; }
-  </style>
-</head>
-<body>
-  <h1>按BOM生成采购单 — {{ part.IPN }} {{ part.name }}</h1>
+{% extends 'weiti_base.html' %}
+{% block title %}按BOM生成采购单{% endblock %}
+{% block subtitle %}按BOM采购 · 供需净额{% endblock %}
+{% block extra_style %}
+<style>
+  h3 { font-size: 14px; margin: 22px 0 0; font-weight: 650; }
+  .bad { color: var(--bad); }
+  #total { font-weight: 700; color: var(--ink); }
+  select { max-width: 240px; }
+  input[type=number] { width: 90px; }
+</style>
+{% endblock %}
+{% block body %}
+  <h1>按BOM生成采购单 <span class="meta">{{ part.IPN }} {{ part.name }}</span></h1>
   {% if src_bo %}
-  <p class="hint" style="color:#b3261e">来源生产单
-    <a class="plain"
-      href="/web/manufacturing/build-order/{{ src_bo.pk }}/">{{ src_bo.reference }}</a>
+  <p class="hint"><span class="bad">来源生产单</span>
+    <a href="/web/manufacturing/build-order/{{ src_bo.pk }}/">{{ src_bo.reference }}</a>
     —— 本页生成的采购单将关联到该生产单及其最上游归属。</p>
   {% endif %}
   <p class="hint">逐层下钻到最底层可采购件。
-    全局净额口径：供给池（库存+在途+在产）先扣除其它开放订单已承诺的需求，
-    再算本单净缺口；<span style="color:#b3261e">「已承诺」</span>标记的在途
-    不可当作本单可用供给。供应商默认取按缺口数量的最低价，可改选。</p>
+    {% if src_bo %}本单口径：净缺口 = 需求 − 关联在途 − 关联在产
+    − 自由供给；自由供给 = max(0, 库存 + 非本单在途/在产 −
+    <span class="bad">已承诺</span>)；在途/在产列只计关联本单的
+    采购行和生产单，已承诺列 = 其它开放订单已提出、等待供给的需求
+    合计（不含本单）。自有供给全额抵扣、自由供给补差——刚好够买。
+    {% else %}全局净额口径：净缺口 = 需求 − （库存 + 在途 + 在产 −
+    <span class="bad">已承诺</span>）；已承诺 = 全部开放订单
+    已提出、等待供给的需求合计。{% endif %}
+    供应商默认取按缺口数量的最低价，可改选。</p>
 
-  <form method="get">
-    {% if src_bo %}<input type="hidden" name="bo"
-      value="{{ src_bo.pk }}">{% endif %}
-    生产/备货数量：<input type="number" name="qty" min="1" step="1"
-      value="{{ qty }}">
-    <button type="submit">重算预览</button>
+  <form method="get" style="margin-top:14px">
+    {% if src_bo %}<input type="hidden" name="bo" value="{{ src_bo.pk }}">{% endif %}
+    生产/备货数量：<input type="number" name="qty" min="1" step="1" value="{{ qty }}">
+    <button type="submit" class="btn">重算预览</button>
   </form>
 
+  {% if closed_bo %}
+  <p class="hint bad">来源生产单已取消/已完成，本页仅供查看，
+    不能再生成采购单。</p>
+  {% endif %}
+  {% if blocked %}
+  <p class="hint bad">操作被拒绝：来源生产单已取消/已完成，
+    未生成采购单。</p>
+  {% endif %}
   {% if created %}
     <h3>已生成采购单</h3>
     <table>
-      <tr><th>采购单</th><th>供应商</th><th>目标日期</th><th></th></tr>
+      <thead><tr><th>采购单</th><th>供应商</th><th>目标日期</th><th></th></tr></thead>
+      <tbody>
       {% for po in created %}
       <tr>
         <td><b>{{ po.reference }}</b></td>
         <td>{{ po.supplier.name }}</td>
         <td>{{ po.target_date|default:"—" }}</td>
-        <td><a class="plain"
-          href="/web/purchasing/purchase-order/{{ po.pk }}/">打开 →</a></td>
+        <td><a href="/web/purchasing/purchase-order/{{ po.pk }}/">打开 →</a></td>
       </tr>
       {% endfor %}
+      </tbody>
     </table>
   {% endif %}
 
@@ -65,14 +63,16 @@
   <h3>需采购（{{ buy|length }} 项）</h3>
   <form method="post">{% csrf_token %}
     <input type="hidden" name="qty" value="{{ qty }}">
-    {% if src_bo %}<input type="hidden" name="bo"
-      value="{{ src_bo.pk }}">{% endif %}
+    {% if src_bo %}<input type="hidden" name="bo" value="{{ src_bo.pk }}">{% endif %}
     <input type="hidden" name="action" value="create">
     <table>
+      <thead>
       <tr><th>IPN</th><th>名称</th><th class="num">需求</th>
           <th class="num">净缺口</th><th class="num">在途</th>
-          <th class="num">在产</th>
+          <th class="num">已承诺</th><th class="num">在产</th>
           <th>供应商</th><th class="num">单价</th><th class="num">小计</th></tr>
+      </thead>
+      <tbody>
       {% for e in buy %}
       <tr data-qty="{{ e.qty }}">
         <td class="ipn">{{ e.part.IPN }}</td>
@@ -82,19 +82,27 @@
         <td class="num">
           {{ e.on_order|floatformat:"-2" }}
           {% for pk, ref in e.pos %}
-            <a class="plain"
-              href="/web/purchasing/purchase-order/{{ pk }}/">{{ ref }}</a>
+            <a href="/web/purchasing/purchase-order/{{ pk }}/">{{ ref }}</a>
           {% endfor %}
-          {% if e.committed > 0 %}
-            <br><span class="bad">已承诺 {{ e.committed|floatformat:"-2" }}</span>
+          {% if e.on_order_all > e.on_order %}
+            <br><span class="muted">另有全局在途
+              {{ e.on_order_all|floatformat:"-2" }}（非本单）</span>
           {% endif %}
+        </td>
+        <td class="num">
+          {% if e.committed > 0 %}
+            <span class="bad">{{ e.committed|floatformat:"-2" }}</span>
+          {% else %}0{% endif %}
         </td>
         <td class="num">
           {{ e.building|floatformat:"-2" }}
           {% for pk, ref in e.bos %}
-            <a class="plain"
-              href="/web/manufacturing/build-order/{{ pk }}/">{{ ref }}</a>
+            <a href="/web/manufacturing/build-order/{{ pk }}/">{{ ref }}</a>
           {% endfor %}
+          {% if e.building_all > e.building %}
+            <br><span class="muted">另有全局在产
+              {{ e.building_all|floatformat:"-2" }}（非本单）</span>
+          {% endif %}
         </td>
         <td>
           {% if e.candidates %}
@@ -108,7 +116,9 @@
             {% endfor %}
           </select>
           {% else %}
-            <span class="bad">无供应商零件</span>
+            <span class="bad">无供应商零件</span><br>
+            <a class="buy-link" target="_blank"
+              href="/web/part/{{ e.part.pk }}/suppliers">+ 去添加供应商</a>
           {% endif %}
         </td>
         <td class="num unit-price">
@@ -117,63 +127,87 @@
         <td class="num subtotal"></td>
       </tr>
       {% endfor %}
+      </tbody>
     </table>
-    <p style="margin-top:12px">
-      <button type="submit">按供应商分组生成采购单</button>
+    {% if not closed_bo %}
+    <p style="margin-top:14px">
+      <button type="submit" class="btn btn-primary">按供应商分组生成采购单</button>
       <span class="hint">预计合计 <span id="total">—</span>
         （无供应商的项会被跳过并记日志）</span>
     </p>
+    {% endif %}
   </form>
   {% else %}
-    <p class="hint" style="margin-top:16px">
-      没有需要采购的叶子件（库存充足或子件均不可采购）。</p>
+    <p class="hint">没有需要采购的叶子件（库存充足或子件均不可采购）。</p>
   {% endif %}
 
   {% if skipped %}
   <h3>跳过项（{{ skipped|length }}）</h3>
   <table>
+    <thead>
     <tr><th>IPN</th><th>名称</th><th class="num">需求</th>
-        <th class="num">库存</th><th class="num">在途</th>
-        <th class="num">在产</th><th>原因</th></tr>
+        <th class="num">{% if src_bo %}可用库存{% else %}库存{% endif %}</th>
+        <th class="num">在途</th>
+        <th class="num">已承诺</th><th class="num">在产</th><th>原因</th></tr>
+    </thead>
+    <tbody>
     {% for s in skipped %}
     <tr>
       <td class="ipn">{{ s.part.IPN }}</td>
       <td>{{ s.part.name }}</td>
       <td class="num">{{ s.need|floatformat:"-2" }}</td>
-      <td class="num">{{ s.stock|floatformat:"-2" }}</td>
+      <td class="num">
+        {% if src_bo %}
+          {{ s.stock_avail|floatformat:"-2" }}
+          {% if s.stock_avail < s.stock %}
+            <br><span class="muted">实物
+              {{ s.stock|floatformat:"-2" }}</span>
+          {% endif %}
+        {% else %}
+          {{ s.stock|floatformat:"-2" }}
+        {% endif %}
+      </td>
       <td class="num">
         {{ s.on_order|floatformat:"-2" }}
         {% for pk, ref in s.pos %}
-          <a class="plain"
-            href="/web/purchasing/purchase-order/{{ pk }}/">{{ ref }}</a>
+          <a href="/web/purchasing/purchase-order/{{ pk }}/">{{ ref }}</a>
         {% endfor %}
-        {% if s.committed > 0 %}
-          <br><span class="bad">已承诺 {{ s.committed|floatformat:"-2" }}</span>
+        {% if s.on_order_all > s.on_order %}
+          <br><span class="muted">另有全局在途
+            {{ s.on_order_all|floatformat:"-2" }}（非本单）</span>
         {% endif %}
+      </td>
+      <td class="num">
+        {% if s.committed > 0 %}
+          <span class="bad">{{ s.committed|floatformat:"-2" }}</span>
+        {% else %}0{% endif %}
       </td>
       <td class="num">
         {{ s.building|floatformat:"-2" }}
         {% for pk, ref in s.bos %}
-          <a class="plain"
-            href="/web/manufacturing/build-order/{{ pk }}/">{{ ref }}</a>
-          {% endfor %}
+          <a href="/web/manufacturing/build-order/{{ pk }}/">{{ ref }}</a>
+        {% endfor %}
+        {% if s.building_all > s.building %}
+          <br><span class="muted">另有全局在产
+            {{ s.building_all|floatformat:"-2" }}（非本单）</span>
+        {% endif %}
       </td>
-      <td class="bad">{{ s.reason }}</td>
+      <td class="muted">{{ s.reason }}</td>
     </tr>
     {% endfor %}
+    </tbody>
   </table>
   {% endif %}
 
-  <p style="margin-top:20px">
-    <a class="plain" href="/web/part/{{ part.pk }}/">← 返回零件</a> ·
-    {% if src_bo %}<a class="plain"
-      href="/plugin/weiti_mdm/build-table/{{ src_bo.pk }}/">返回物料穿透</a> ·
-    {% endif %}
-    <a class="plain" href="/plugin/weiti_mdm/schedule/">排单看板</a>
-  </p>
-
+  <div class="foot">
+    <a href="/web/part/{{ part.pk }}/">← 返回零件</a>
+    {% if src_bo %}<a
+      href="/plugin/weiti_mdm/build-table/{{ src_bo.pk }}/">返回物料透查</a>{% endif %}
+    <a href="/plugin/weiti_mdm/schedule/">排单看板</a>
+  </div>
+{% endblock %}
+{% block scripts %}
   <script>
-    // 选供应商时实时重算单价、小计、合计
     function recalc() {
       var total = 0, has = false;
       document.querySelectorAll('tr[data-qty]').forEach(function (tr) {
@@ -205,5 +239,4 @@
     });
     recalc();
   </script>
-</body>
-</html>
+{% endblock %}

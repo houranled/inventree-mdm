@@ -119,6 +119,36 @@ def _uncovered(part, need):
     return max(gap, Decimal(0))
 
 
+def _committed_map():
+    """{part_pk: 全部开放订单的已承诺需求合计}——聚合一次供级联逐行复用。"""
+    try:
+        return {r['part'].pk: r['need'] for r in collect_shortages()}
+    except Exception:
+        return {}
+
+
+def _net_gap(part, need, committed=None):
+    """净额口径缺口：供给池（库存+在产+在途）先偿还其它开放订单
+    已承诺的需求，再看本行还差多少。
+
+    committed 传 _committed_map() 的结果；committed 里已含本行需求
+    （BuildLine 已生成的情形），故先减去本行需求才是"别人占的量"。
+    committed=None 时退回 _uncovered 物理口径（兜底幂等）。
+    """
+    need = Decimal(str(need))
+    if committed is None:
+        return _uncovered(part, need)
+    supply = Decimal(str(part.available_stock or 0))
+    for attr in ('quantity_being_built', 'on_order'):
+        try:
+            supply += Decimal(str(getattr(part, attr) or 0))
+        except Exception:
+            pass
+    others = max(Decimal(0), committed.get(part.pk, Decimal(0)) - need)
+    free = max(Decimal(0), supply - others)
+    return max(Decimal(0), need - free)
+
+
 # ------------------------------------------------------------------
 # 齐套判定
 # ------------------------------------------------------------------
@@ -336,13 +366,14 @@ def _create_build(part, qty, source_order, need_by):
     from build.models import Build
     from build.status_codes import BuildStatus
     is_build_src = source_order.__class__.__name__ == 'Build'
-    return Build.objects.create(
+    bo = Build.objects.create(
         part=part,
         quantity=qty,
         title='由 %s 自动生成' % _src_ref(source_order),
         parent=source_order if is_build_src else None,
-        sales_order=(source_order.sales_order if is_build_src
-                     else source_order
+        # 只挂顶层：SO 直建的 BO 记 sales_order；子 BO 不挂 SO
+        #（SO页生产订单列表=用户真正订的整机，子树靠 parent+溯源标签）
+        sales_order=(source_order
                      if source_order.__class__.__name__ == 'SalesOrder'
                      else None),
         responsible=_responsible_of(source_order),
@@ -352,6 +383,39 @@ def _create_build(part, qty, source_order, need_by):
         status=BuildStatus.PENDING,
         metadata={META_SRC: _src_tag(source_order),
                   META_ROOT: _src_tag(_root_source(source_order))})
+    if is_build_src:
+        # 子BO直接下达进生产：顶层BO发布即整棵树一键投产，
+        # 其 issue 事件会继续向下级联建更深层的子单/PO。
+        # issue_build 不可用/失败时手工转态+发事件兜底。
+        prod = getattr(BuildStatus.PRODUCTION, 'value',
+                       BuildStatus.PRODUCTION)
+        try:
+            try:
+                bo.issue_build()
+            except TypeError:
+                bo.issue_build(None)
+        except Exception:
+            logger.exception('WeiTiMDM: %s issue_build 调用失败',
+                             bo.reference)
+        try:
+            bo.refresh_from_db(fields=['status'])
+        except Exception:
+            pass
+        if bo.status != prod:
+            try:
+                bo.status = prod
+                if hasattr(bo, 'issuance_date'):
+                    bo.issuance_date = _today()
+                bo.save()
+                try:
+                    from plugin.events import trigger_event
+                except ImportError:
+                    from InvenTree.tasks import trigger_event
+                trigger_event('build.issued', id=bo.pk)
+            except Exception:
+                logger.exception('WeiTiMDM: 子生产单 %s 自动下达失败，保持待生产',
+                                 bo.reference)
+    return bo
 
 
 def _create_po_lines(plugin, items, source_order, need_by):
@@ -411,13 +475,16 @@ def _create_po_lines(plugin, items, source_order, need_by):
 
 
 def on_sales_order_issued(plugin, so):
-    """SO 缺料 → 建 BO 或挂 PO（建单/下达/行变更任一时机均可调用）。"""
+    """SO 缺料 → 建 BO 或挂 PO（建单/下达/行变更任一时机均可调用）。
+
+    净额口径：已承诺给其它订单的在产/在途不算本单供给。"""
     to_build, to_buy = [], []
+    committed = _committed_map()
     for line in so.lines.select_related('part').all():
         if not line.part:
             continue
         need = _line_need_so(line)
-        gap = _uncovered(line.part, need)
+        gap = _net_gap(line.part, need, committed)
         if gap <= 0:
             continue
         need_by = line.target_date or so.target_date
@@ -452,9 +519,13 @@ def on_sales_order_issued(plugin, so):
 
 def on_build_issued(plugin, build):
     """BO BOM 行缺料 → 外购件挂 PO；assembly 交给 Auto Create Builds
-    （未启用时本插件兜底建子 BO）。建单/下达/行变更任一时机均可调用。"""
+    （未启用时本插件兜底建子 BO）。建单/下达/行变更任一时机均可调用。
+
+    净额口径：已承诺给其它订单的在产/在途不算本单供给，
+    避免"别人在产的料"被当成自由供给而漏建子单。"""
     to_buy, to_build = [], []
     skip_assembly = _autocreate_active()
+    committed = _committed_map()
     for line in build.build_lines.select_related(
             'bom_item__sub_part').all():
         if line.bom_item and getattr(line.bom_item, 'is_consumable', False):
@@ -463,7 +534,7 @@ def on_build_issued(plugin, build):
         if need <= 0:
             continue
         sub = line.bom_item.sub_part
-        gap = _uncovered(sub, need)
+        gap = _net_gap(sub, need, committed)
         if gap <= 0:
             continue
         need_by = build.target_date
@@ -504,14 +575,32 @@ def cancel_generated_children(source):
     from order.status_codes import PurchaseOrderStatus
 
     if kind == 'SalesOrder':
-        builds = Build.objects.filter(
-            sales_order=source, status=BuildStatus.PENDING)
+        # 子BO不再挂sales_order——取顶层BO并沿parent链收齐子孙，
+        # 同步保证整棵树取消（不完全依赖 build.cancelled 事件级联）
+        ids = set()
+        for t in Build.objects.filter(sales_order=source):
+            try:
+                ids.update(t.get_descendants(include_self=True)
+                           .values_list('pk', flat=True))
+            except Exception:
+                ids.add(t.pk)
+        builds = Build.objects.filter(pk__in=ids,
+                                      status=BuildStatus.PENDING)
     elif kind == 'Build':
-        builds = Build.objects.filter(
-            parent=source, status=BuildStatus.PENDING)
+        # 本BO及其子孙中仍是PENDING的
+        ids = {source.pk}
+        try:
+            ids.update(source.get_descendants(include_self=False)
+                       .values_list('pk', flat=True))
+        except Exception:
+            pass
+        builds = Build.objects.filter(pk__in=ids,
+                                      status=BuildStatus.PENDING)
     else:
         builds = Build.objects.none()
     for b in builds:
+        if b.status != BuildStatus.PENDING:  # 可能已被级联取消
+            continue
         try:
             b.cancel_build(None)
         except Exception:
@@ -712,7 +801,10 @@ def auto_shortage_scan(plugin):
 # ------------------------------------------------------------------
 
 def task_check_sales_order(so_id):
-    """SO 行项目保存后异步检查：缺料→建单；顺带刷新齐套标记。"""
+    """SO 行项目保存后异步检查：缺料→建单；顺带刷新齐套标记。
+
+    草稿（待生产）状态的 SO 不建下游单——只刷新齐套标记；
+    正式发布时 salesorder.issued 事件再触发建单级联。"""
     plugin = get_plugin()
     if not plugin or not plugin.get_setting('OF_ENABLE'):
         return
@@ -722,7 +814,8 @@ def task_check_sales_order(so_id):
     except Exception:
         return
     try:
-        on_sales_order_issued(plugin, so)
+        if not _is_pending(so):
+            on_sales_order_issued(plugin, so)
         transition = _write_kit_flag(
             so, check_sales_order_kitted(so), 'so')
         if transition == 'became_kitted' and not _is_pending(so):
@@ -734,7 +827,10 @@ def task_check_sales_order(so_id):
 
 
 def task_check_build(build_id):
-    """BO 或其行项目保存后异步检查：缺料→建单；顺带刷新齐套标记。"""
+    """BO 或其行项目保存后异步检查：缺料→建单；顺带刷新齐套标记。
+
+    草稿（待生产）状态的 BO 不建下游单——只刷新齐套标记；
+    正式发布时 build.issued 事件再触发建单级联。"""
     plugin = get_plugin()
     if not plugin or not plugin.get_setting('OF_ENABLE'):
         return
@@ -744,7 +840,8 @@ def task_check_build(build_id):
     except Exception:
         return
     try:
-        on_build_issued(plugin, bo)
+        if not _is_pending(bo):
+            on_build_issued(plugin, bo)
         transition = _write_kit_flag(
             bo, check_build_kitted(bo), 'build')
         if transition == 'became_kitted' and not _is_pending(bo):
@@ -796,78 +893,249 @@ def collect_bom_leaves(part, qty):
     return list(agg.values())
 
 
-def collect_bom_purchasables(part, qty, net_open=False):
+def _source_demand_keys(source):
+    """来源订单家族的需求键 {('Build'|'SalesOrder', pk)}——用于把
+    本单自己的已承诺需求从"别人占的"中剔除（本页需求即这些承诺，
+    重复扣会双算）。"""
+    keys = set()
+    if source is None:
+        return keys
+    kind = source.__class__.__name__
+    if kind not in ('Build', 'SalesOrder'):
+        return keys
+    keys.add((kind, source.pk))
+    try:
+        if kind == 'Build':
+            for pk in (source.get_descendants(include_self=True)
+                       .values_list('pk', flat=True)):
+                keys.add(('Build', pk))
+            if getattr(source, 'sales_order_id', None):
+                keys.add(('SalesOrder', source.sales_order_id))
+        else:  # SalesOrder：其生产单（含子孙）的需求也算本家族的
+            from build.models import Build
+            for b in Build.objects.filter(sales_order=source):
+                keys.add(('Build', b.pk))
+                try:
+                    for pk in (b.get_descendants(include_self=False)
+                               .values_list('pk', flat=True)):
+                        keys.add(('Build', pk))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return keys
+
+
+def _linked_pos(source):
+    """{part_pk: {'qty': 未收货量, 'pos': [(pk, ref)]}}——
+    关联来源订单家族的开放采购行。
+
+    Build：weiti_source/weiti_root 命中本BO及子孙BO标签；
+    SalesOrder：标签指向该 SO。已收货部分入库存，只计未收量。
+    """
+    if source is None:
+        return {}
+    from django.db.models import Q
+    kind = source.__class__.__name__
+    if kind == 'Build':
+        tags = ['Build:%s' % source.pk]
+        try:
+            tags = ['Build:%s' % b.pk
+                    for b in source.get_descendants(include_self=True)]
+        except Exception:
+            pass
+        q = (Q(metadata__weiti_source__in=tags)
+             | Q(metadata__weiti_root__in=tags))
+    elif kind == 'SalesOrder':
+        tag = 'SalesOrder:%s' % source.pk
+        q = (Q(metadata__weiti_source=tag)
+             | Q(metadata__weiti_root=tag))
+    else:
+        return {}
+    try:
+        from order.models import PurchaseOrder, PurchaseOrderLineItem
+        from order.status_codes import PurchaseOrderStatusGroups
+        ids = set(PurchaseOrder.objects
+                  .filter(q, status__in=PurchaseOrderStatusGroups.OPEN)
+                  .values_list('pk', flat=True))
+        if not ids:
+            return {}
+        agg = {}
+        for li in (PurchaseOrderLineItem.objects
+                   .filter(order_id__in=ids)
+                   .select_related('order', 'part')):
+            pk = li.part.part_id
+            rec = agg.setdefault(pk, {'qty': Decimal(0), 'pos': {}})
+            rec['qty'] += (Decimal(str(li.quantity))
+                           - Decimal(str(li.received or 0)))
+            rec['pos'][li.order_id] = li.order.reference
+        return {pk: {'qty': v['qty'], 'pos': list(v['pos'].items())}
+                for pk, v in agg.items()}
+    except Exception:
+        return {}
+
+
+def _linked_builds(source):
+    """{part_pk: {'qty': 未完成量, 'bos': [(pk, ref)]}}——
+    关联来源订单家族的活跃生产单（产成品在产量）。
+
+    Build：本BO及子孙BO（parent链），或打 weiti_source/root 标签者；
+    SalesOrder：sales_order 外键或标签指向该 SO。
+    """
+    if source is None:
+        return {}
+    from django.db.models import Q
+    kind = source.__class__.__name__
+    if kind == 'Build':
+        family = {source.pk}
+        try:
+            family = {b.pk for b in
+                      source.get_descendants(include_self=True)}
+        except Exception:
+            pass
+        tags = ['Build:%s' % pk for pk in family]
+        q = (Q(pk__in=family)
+             | Q(metadata__weiti_source__in=tags)
+             | Q(metadata__weiti_root__in=tags))
+    elif kind == 'SalesOrder':
+        tag = 'SalesOrder:%s' % source.pk
+        q = (Q(sales_order=source)
+             | Q(metadata__weiti_source=tag)
+             | Q(metadata__weiti_root=tag))
+    else:
+        return {}
+    try:
+        from build.models import Build
+        from build.status_codes import BuildStatusGroups
+        agg = {}
+        for b in Build.objects.filter(
+                q, status__in=BuildStatusGroups.ACTIVE_CODES):
+            rem = (Decimal(str(b.quantity))
+                   - Decimal(str(getattr(b, 'completed', 0) or 0)))
+            if rem <= 0:
+                continue
+            rec = agg.setdefault(b.part_id, {'qty': Decimal(0),
+                                             'bos': []})
+            rec['qty'] += rem
+            rec['bos'].append((b.pk, b.reference))
+        return agg
+    except Exception:
+        return {}
+
+
+def collect_bom_purchasables(part, qty, net_open=False, source=None):
     """在摊平叶子件基础上分出 需采购/跳过 两组。
 
     返回 (buy, skipped)：
-      buy     = [{'part','need','qty','candidates','on_order','committed'}]
+      buy     = [{'part','need','qty','candidates','on_order','committed',
+                  'own_in'}]
                 qty=净缺口(扣可用/在产/在途)
       skipped = [{'part','need','reason','stock','on_order','building',
-                  'committed'}]
+                  'committed','own_in'}]
 
-    net_open=True 按全局净额：供给池（库存+在途+在产）先偿还所有开放
-    SO/BO 已对该零件提出的需求，剩余"自由供给"才参与本单扣减——
-    防止已承诺给其它订单的在途 PO 被重复当作可用供给。
+    net_open=True 按净额扣减。source=来源订单（Build/SalesOrder）
+    时用本单专属口径：
+      在途 = 只计关联本单家族的开放采购行未收量；
+      在产 = 只计关联本单家族的活跃生产单未完成量；
+      已承诺 = 其它开放订单已提出的需求（本单家族剔除）；
+      净缺口 = 需求 − 关联在途 − 关联在产 − max(0, 库存 − 已承诺)
+    ——其它订单的承诺只从共享库存里扣，不吃本单专用供给。
+    无 source 时退回全局口径（库存+全局在途+全局在产 − 全部已承诺）。
     """
-    committed = {}
+    committed, own_in, own_bld = {}, {}, {}
     if net_open:
-        committed = {r['part'].pk: r['need'] for r in collect_shortages()}
+        excl = _source_demand_keys(source)
+        for r in collect_shortages():
+            tot = Decimal(str(r['need']))
+            own = sum(Decimal(str(d['qty']))
+                      for d in r.get('demands', [])
+                      if (d.get('kind'), d.get('pk')) in excl)
+            committed[r['part'].pk] = max(Decimal(0), tot - own)
+        own_in = _linked_pos(source)
+        own_bld = _linked_builds(source)
     skipped = []
     buy = []
     for e in collect_bom_leaves(part, qty):
         p = e['part']
-        stock = p.available_stock or 0
-        on_order = getattr(p, 'on_order', 0) or 0
-        building = getattr(p, 'quantity_being_built', 0) or 0
+        stock = Decimal(str(p.available_stock or 0))
+        on_order_all = Decimal(str(getattr(p, 'on_order', 0) or 0))
+        building_all = Decimal(
+            str(getattr(p, 'quantity_being_built', 0) or 0))
         comm = committed.get(p.pk, Decimal(0))
+        oin = own_in.get(p.pk, {'qty': Decimal(0), 'pos': []})
+        obd = own_bld.get(p.pk, {'qty': Decimal(0), 'bos': []})
         if net_open:
-            free = (Decimal(str(stock)) + Decimal(str(on_order))
-                    + Decimal(str(building)) - Decimal(str(comm)))
-            gap = e['need'] - max(free, Decimal(0))
+            if source is not None:
+                # 本单口径，不多不少刚好够买：
+                # 自有供给（关联在途+关联在产）全额抵扣；
+                # 自由供给 = 共享库存 + 非本单在途/在产，先偿还其它
+                # 订单已承诺（它们的承诺会先吃掉这部分），剩余才抵扣
+                free = max(Decimal(0),
+                           stock + (on_order_all - oin['qty'])
+                           + (building_all - obd['qty']) - comm)
+                gap = e['need'] - oin['qty'] - obd['qty'] - free
+                on_order = oin['qty']
+                building = obd['qty']
+            else:
+                free = stock + on_order_all + building_all - comm
+                gap = e['need'] - max(free, Decimal(0))
+                on_order = on_order_all
+                building = building_all
             gap = max(gap, Decimal(0))
         else:
             gap = _uncovered(p, e['need'])
+            on_order = on_order_all
+            building = building_all
+        extra = {'stock': stock,
+                 'stock_avail': max(Decimal(0), stock - comm),
+                 'on_order': on_order,
+                 'building': building, 'committed': comm,
+                 'own_in': oin['qty'], 'own_pos': oin['pos'],
+                 'own_bos': obd['bos'],
+                 'on_order_all': on_order_all,
+                 'building_all': building_all}
         if not p.purchaseable:
-            skipped.append({'part': p, 'need': e['need'],
-                            'reason': '无下层BOM且未勾选可购买',
-                            'committed': comm})
+            skipped.append(dict(extra, part=p, need=e['need'],
+                                reason='无下层BOM且未勾选可购买'))
             continue
         if gap > 0:
+            e.update(extra)
             e['qty'] = gap
-            e['stock'] = stock
-            e['on_order'] = on_order
-            e['building'] = building
-            e['committed'] = comm
-            # 供应商候选：按缺口数量取价，价格升序（无价排末尾）
-            cands = []
-            for sp in p.supplier_parts.filter(
-                    supplier__active=True, supplier__is_supplier=True):
-                try:
-                    price = sp.get_price(gap)
-                except Exception:
-                    price = None
-                cands.append({'sp_pk': sp.pk, 'sp': sp,
-                              'supplier': str(sp.supplier.name),
-                              'sku': sp.SKU or '',
-                              'price': price})
-            cands.sort(key=lambda c: float(c['price'].amount)
-                       if c['price'] is not None else float('inf'))
-            e['candidates'] = cands
+            e['candidates'] = _supplier_candidates(p, gap)
             buy.append(e)
         else:
-            skipped.append({'part': p, 'need': e['need'],
-                            'reason': '库存/在途已覆盖',
-                            'stock': stock, 'on_order': on_order,
-                            'building': building, 'committed': comm})
-    # 无下层BOM且不可采购的也补数字，便于排查
-    for s in skipped:
-        if 'stock' not in s:
-            p = s['part']
-            s['stock'] = p.available_stock or 0
-            s['on_order'] = getattr(p, 'on_order', 0) or 0
-            s['building'] = getattr(p, 'quantity_being_built', 0) or 0
-            s.setdefault('committed', committed.get(p.pk, Decimal(0)))
+            if source is not None:
+                if (oin['qty'] + obd['qty']) > 0:
+                    reason = '关联本单供给已覆盖'
+                elif stock > comm:
+                    reason = '库存已覆盖'
+                else:
+                    reason = '自由供给（非本单在途/在产）已覆盖'
+            else:
+                reason = '库存/在途已覆盖'
+            skipped.append(dict(extra, part=p, need=e['need'],
+                                reason=reason))
     return buy, skipped
+
+
+def _supplier_candidates(part, qty):
+    """供应商候选：按 qty 数量取价，价格升序（无报价排末尾）。
+
+    返回 [{'sp_pk','sp','supplier','sku','price'}]。"""
+    cands = []
+    for sp in part.supplier_parts.filter(
+            supplier__active=True, supplier__is_supplier=True):
+        try:
+            price = sp.get_price(qty)
+        except Exception:
+            price = None
+        cands.append({'sp_pk': sp.pk, 'sp': sp,
+                      'supplier': str(sp.supplier.name),
+                      'sku': sp.SKU or '',
+                      'price': price})
+    cands.sort(key=lambda c: float(c['price'].amount)
+               if c['price'] is not None else float('inf'))
+    return cands
 
 
 def create_pos_for_part(plugin, items, part, need_by=None):
@@ -977,10 +1245,13 @@ def order_trace(order):
     """
     from build.models import Build
     from order.models import PurchaseOrder
+    from django.db.models import Q
 
     rows = []
     labels = {'SalesOrder': '销售单', 'Build': '生产单',
               'PurchaseOrder': '采购单', 'Part': '零件'}
+
+    entry_key = (order.__class__.__name__, order.pk)
 
     def emit(obj, kind, depth):
         url_tpl = _SRC_URLS.get(kind, '')
@@ -992,6 +1263,7 @@ def order_trace(order):
             'status': (obj.get_status_display()
                        if hasattr(obj, 'get_status_display') else ''),
             'kitted': (obj.metadata or {}).get(META_KITTED),
+            'current': (kind, obj.pk) == entry_key,
             'url': url_tpl % obj.pk if url_tpl else ''})
 
     def walk(obj, kind, depth, seen):
@@ -1005,12 +1277,37 @@ def order_trace(order):
                 walk(b, 'Build', depth + 1, seen)
         if kind in ('SalesOrder', 'Build'):
             src = '%s:%s' % (kind, obj.pk)
+            # 直接来源或最上游归属指向本单的 PO 都算下游
             for po in PurchaseOrder.objects.filter(
-                    metadata__weiti_source=src):
+                    Q(metadata__weiti_source=src)
+                    | Q(metadata__weiti_root=src)):
                 walk(po, 'PurchaseOrder', depth + 1, seen)
         if kind == 'Build':
             for b in Build.objects.filter(parent=obj):
                 walk(b, 'Build', depth + 1, seen)
 
-    walk(order, order.__class__.__name__, 0, set())
+    # 从任意节点进入都先爬到最上游根，再从根渲染整棵树
+    #（PO/子BO 进入时也能看到完整 SO→BO→PO 链，入口节点高亮）
+    root, root_kind = _trace_root(order)
+    walk(root, root_kind, 0, set())
     return rows
+
+
+def _trace_root(order):
+    """穿透入口 → 追溯到最上游根节点，返回 (root_obj, root_kind)。
+
+    PO：先看 metadata.weiti_root/weiti_source，解析出 SO/BO 再继续上爬；
+    BO：沿 parent 爬顶，顶层有 SO 则根=SO；
+    SO：自身即根；手工单无 metadata 时以自身为根。
+    """
+    kind = order.__class__.__name__
+    if kind == 'PurchaseOrder':
+        md = order.metadata or {}
+        up = _resolve_tag(md.get('weiti_root') or md.get('weiti_source') or '')
+        if up is None:
+            return order, kind          # 手工 PO：无上游，根即自身
+        order, kind = up, up.__class__.__name__
+    if kind == 'Build':
+        root = _root_source(order)      # 爬 parent 链，顶层有 SO 则返回 SO
+        return root, root.__class__.__name__
+    return order, kind

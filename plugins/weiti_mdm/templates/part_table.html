@@ -1,46 +1,28 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>物料明细总表 — {{ part.name }}</title>
-  <style>
-    body { font-family: system-ui, "Microsoft YaHei", sans-serif;
-           max-width: 1400px; margin: 32px auto; padding: 0 16px;
-           color: #222; }
-    h1 { font-size: 20px; }
-    .hint { color: #888; font-size: 13px; }
-    table { border-collapse: collapse; width: 100%; margin-top: 12px;
-            font-size: 13px; }
-    th, td { border: 1px solid #e2e2e2; padding: 6px 8px;
-             text-align: left; vertical-align: middle; }
-    th { background: #f6f8fa; white-space: nowrap; }
-    .ipn { font-family: ui-monospace, monospace; }
-    .num { text-align: right; }
-    .gap { color: #b3261e; font-weight: 700; }
-    .ok { color: #2b8a3e; }
-    tr.short td { background: #fff8f8; }
-    img.thumb { max-width: 44px; max-height: 44px; display: block; }
-    a.plain { color: #2f6feb; text-decoration: none; }
-    input[type=number] { width: 80px; padding: 4px; }
-    button { padding: 6px 18px; }
-    .spec { color: #555; font-size: 12px; }
-    .noipn { color: #b3261e; }
-  </style>
-</head>
-<body>
-  <h1>物料明细总表 — {{ part.IPN }} {{ part.name }}</h1>
+{% extends 'weiti_base.html' %}
+{% block title %}物料明细总表 — {{ part.name }}{% endblock %}
+{% block subtitle %}物料明细 · 工程/库存/采购{% endblock %}
+{% block extra_style %}
+<style>
+  .spec { color: #6a7284; font-size: 12px; }
+  .noipn { color: var(--bad); }
+  input[type=number] { width: 90px; }
+  .scroll { overflow-x: auto; }
+</style>
+{% endblock %}
+{% block body %}
+  <h1>物料明细总表 <span class="meta">{{ part.IPN }} {{ part.name }}</span></h1>
   <p class="hint">摊平到最底层叶子件（半成品子装配继续下钻）。
     需求合计 = 单套需求 × 套数。缺口 = 需求合计 − 库存 − 在产 − 在途。红色行 = 有净缺口。</p>
 
-  <form method="get">
-    套数：<input type="number" name="qty" min="1" step="1"
-      value="{{ qty }}">
-    <button type="submit">重算</button>
+  <form method="get" style="margin-top:14px">
+    套数：<input type="number" name="qty" min="1" step="1" value="{{ qty }}">
+    <button type="submit" class="btn">重算</button>
   </form>
 
   {% if rows %}
+  <div class="scroll">
   <table>
+    <thead>
     <tr>
       <th>#</th><th>图片</th><th>IPN</th><th>名称</th><th>类别</th>
       <th>规格参数</th><th>材质</th><th>工艺</th><th>用途/位号</th>
@@ -51,13 +33,14 @@
       <th class="num">参考单价</th><th class="num">采购周期</th>
       <th>备注</th><th>附件</th>
     </tr>
+    </thead>
+    <tbody>
     {% for r in rows %}
-    <tr{% if r.gap > 0 %} class="short"{% endif %}>
-      <td>{{ forloop.counter }}</td>
+    <tr{% if r.gap > 0 %} class="row-short"{% endif %}>
+      <td class="muted">{{ forloop.counter }}</td>
       <td>{% if r.img %}<img class="thumb" src="{{ r.img }}">{% endif %}</td>
       <td class="ipn{% if not r.part.IPN or r.part.IPN|slice:":1" == "!" %} noipn{% endif %}">{{ r.part.IPN|default:"—" }}</td>
-      <td><a class="plain"
-          href="/web/part/{{ r.part.pk }}/">{{ r.part.name }}</a></td>
+      <td><a href="/web/part/{{ r.part.pk }}/">{{ r.part.name }}</a></td>
       <td>{{ r.part.category.name|default:"—" }}</td>
       <td class="spec">{{ r.spec|default:"—" }}</td>
       <td>{{ r.material|default:"—" }}</td>
@@ -69,21 +52,18 @@
       <td class="num">{{ r.stock|floatformat:"-2" }}</td>
       <td class="num">
         {% if r.pos|length == 1 %}{% for pk, ref in r.pos %}
-          <a class="plain"
-            href="/web/purchasing/purchase-order/{{ pk }}/">{{ r.on_order|floatformat:"-2" }} ↗</a>
+          <a href="/web/purchasing/purchase-order/{{ pk }}/">{{ r.on_order|floatformat:"-2" }} ↗</a>
         {% endfor %}{% else %}
           {{ r.on_order|floatformat:"-2" }}
           {% for pk, ref in r.pos %}
-            <a class="plain"
-              href="/web/purchasing/purchase-order/{{ pk }}/">{{ ref }}</a>
+            <a href="/web/purchasing/purchase-order/{{ pk }}/">{{ ref }}</a>
           {% endfor %}
         {% endif %}
       </td>
       <td class="num">
         {{ r.building|floatformat:"-2" }}
         {% for pk, ref in r.bos %}
-          <a class="plain"
-            href="/web/manufacturing/build-order/{{ pk }}/">{{ ref }}</a>
+          <a href="/web/manufacturing/build-order/{{ pk }}/">{{ ref }}</a>
         {% endfor %}
       </td>
       <td class="num">
@@ -98,21 +78,22 @@
       <td class="spec">{{ r.part.description|default:"—" }}</td>
       <td>
         {% for a in r.attachments %}
-          <a class="plain" href="{{ a.url }}" target="_blank">{{ a.name }}</a>
+          <a href="{{ a.url }}" target="_blank">{{ a.name }}</a>
         {% endfor %}
       </td>
     </tr>
     {% endfor %}
+    </tbody>
   </table>
+  </div>
   {% else %}
-    <p class="hint" style="margin-top:16px">该零件没有 BOM 明细。</p>
+    <p class="hint">该零件没有 BOM 明细。</p>
   {% endif %}
 
-  <p style="margin-top:20px">
-    <a class="plain" href="/web/part/{{ part.pk }}/">← 返回零件</a> ·
-    <a class="plain" href="/plugin/weiti_mdm/part-po/{{ part.pk }}/">按BOM采购</a> ·
-    <a class="plain" href="/plugin/weiti_mdm/bom-export/{{ part.pk }}/">导出BOM</a> ·
-    <a class="plain" href="/plugin/weiti_mdm/schedule/">排单看板</a>
-  </p>
-</body>
-</html>
+  <div class="foot">
+    <a href="/web/part/{{ part.pk }}/">← 返回零件</a>
+    <a href="/plugin/weiti_mdm/part-po/{{ part.pk }}/">按BOM采购</a>
+    <a href="/plugin/weiti_mdm/bom-export/{{ part.pk }}/">导出BOM</a>
+    <a href="/plugin/weiti_mdm/schedule/">排单看板</a>
+  </div>
+{% endblock %}

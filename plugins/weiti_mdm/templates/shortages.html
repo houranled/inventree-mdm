@@ -1,38 +1,23 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>缺料总览</title>
-  <style>
-    body { font-family: system-ui, "Microsoft YaHei", sans-serif;
-           max-width: 1400px; margin: 32px auto; padding: 0 16px;
-           color: #222; }
-    h1 { font-size: 20px; }
-    .hint { color: #888; font-size: 13px; }
-    table { border-collapse: collapse; width: 100%; margin-top: 12px;
-            font-size: 13px; }
-    th, td { border: 1px solid #e2e2e2; padding: 6px 8px;
-             text-align: left; vertical-align: top; }
-    th { background: #f6f8fa; white-space: nowrap; }
-    .ipn { font-family: ui-monospace, monospace; }
-    .num { text-align: right; }
-    .gap { color: #b3261e; font-weight: 700; }
-    .ok { color: #2b8a3e; }
-    tr.short td { background: #fff8f8; }
-    a.plain { color: #2f6feb; text-decoration: none; }
-    .dm { font-size: 12px; line-height: 1.7; }
-    .dm .d { white-space: nowrap; }
-    .late { color: #b3261e; }
-  </style>
-</head>
-<body>
-  <h1>缺料总览 — 所有开放订单</h1>
+{% extends 'weiti_base.html' %}
+{% block title %}缺料总览{% endblock %}
+{% block subtitle %}缺料总览 · 全局采购视角{% endblock %}
+{% block extra_style %}
+<style>
+  td.dm { vertical-align: top; }
+  .dm { font-size: 12px; line-height: 1.8; }
+  .dm .d { white-space: nowrap; }
+  .late { color: var(--bad); }
+  .mtag { color: var(--ok); font-weight: 600; }
+</style>
+{% endblock %}
+{% block body %}
+  <h1>缺料总览 <span class="meta">所有开放订单</span></h1>
   <p class="hint">聚合所有开放销售订单/生产订单的零件需求；
     缺口 = 需求 − 库存 − 在产 − 在途。有缺口的行排前面并按最早需求日排序。</p>
 
   {% if rows %}
   <table>
+    <thead>
     <tr>
       <th>#</th><th>IPN</th><th>名称</th>
       <th class="num">总需求</th><th class="num">库存</th>
@@ -40,28 +25,27 @@
       <th class="num">缺口</th><th>供应商</th>
       <th class="num">参考单价</th><th>需求来源</th>
     </tr>
+    </thead>
+    <tbody>
     {% for r in rows %}
-    <tr{% if r.gap > 0 %} class="short"{% endif %}>
-      <td>{{ forloop.counter }}</td>
+    <tr{% if r.gap > 0 %} class="row-short"{% endif %}>
+      <td class="muted">{{ forloop.counter }}</td>
       <td class="ipn">{{ r.part.IPN|default:"—" }}</td>
-      <td><a class="plain"
-          href="/web/part/{{ r.part.pk }}/">{{ r.part.name }}</a></td>
+      <td><a href="/web/part/{{ r.part.pk }}/">{{ r.part.name }}</a></td>
       <td class="num">{{ r.need|floatformat:"-2" }}</td>
       <td class="num">{{ r.stock|floatformat:"-2" }}</td>
       <td class="num">
         {{ r.on_order|floatformat:"-2" }}
         {% for pk, ref in r.pos %}
-          <a class="plain"
-            href="/web/purchasing/purchase-order/{{ pk }}/">{{ ref }}</a>
+          <a href="/web/purchasing/purchase-order/{{ pk }}/">{{ ref }}</a>
         {% endfor %}
       </td>
       <td class="num">
         {{ r.building|floatformat:"-2" }}
         {% for pk, ref in r.bos %}
-          <a class="plain"
-            href="/web/manufacturing/build-order/{{ pk }}/">{{ ref }}</a>
-          <a class="plain" href="/plugin/weiti_mdm/build-table/{{ pk }}/"
-            style="color:#0b8a5b" title="物料穿透">物料</a>
+          <a href="/web/manufacturing/build-order/{{ pk }}/">{{ ref }}</a>
+          <a class="mtag" href="/plugin/weiti_mdm/build-table/{{ pk }}/"
+            title="物料透查">物料</a>
         {% endfor %}
       </td>
       <td class="num">
@@ -73,31 +57,29 @@
       <td class="dm">
         {% for d in r.demands %}
           <div class="d">
-            <a class="plain" href="{{ d.url }}">{{ d.ref }}</a>
+            <a href="{{ d.url }}">{{ d.ref }}</a>
             {% if d.table_url %}
-              <a class="plain" href="{{ d.table_url }}"
-                style="color:#0b8a5b" title="查看该生产单物料穿透">物料</a>
+              <a class="mtag" href="{{ d.table_url }}"
+                title="查看该生产单物料透查">物料</a>
             {% endif %}
             ×{{ d.qty|floatformat:"-2" }}
             {% if d.date %}<span class="late">{{ d.date }}</span>{% endif %}
             {% if d.root_ref %}
-              <a class="plain" href="{{ d.root_url }}"
-                style="color:#888">← {{ d.root_ref }}</a>
+              <a class="muted" href="{{ d.root_url }}">← {{ d.root_ref }}</a>
             {% endif %}
           </div>
         {% endfor %}
       </td>
     </tr>
     {% endfor %}
+    </tbody>
   </table>
   {% else %}
-    <p class="hint" style="margin-top:16px">
-      当前没有开放订单的零件需求。</p>
+    <p class="hint">当前没有开放订单的零件需求。</p>
   {% endif %}
 
-  <p style="margin-top:20px">
-    <a class="plain" href="/plugin/weiti_mdm/schedule/">排单看板</a> ·
-    <a class="plain" href="/plugin/weiti_mdm/pending-parts/">待完善编码</a>
-  </p>
-</body>
-</html>
+  <div class="foot">
+    <a href="/plugin/weiti_mdm/schedule/">排单看板</a>
+    <a href="/plugin/weiti_mdm/pending-parts/">待完善编码</a>
+  </div>
+{% endblock %}

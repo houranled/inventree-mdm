@@ -973,10 +973,10 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                     'build-order': 'build',
                     'purchase-order': 'purchaseorder'}
             if mo.group(1) == 'build-order':
-                # 物料穿透已融合订单穿透（上游链 + BOM树挂子BO/PO）
+                # 物料透查已融合订单穿透（上游链 + BOM树挂子BO/PO）
                 oactions = [{
                     'key': 'weiti-build-table',
-                    'title': '物料穿透',
+                    'title': '物料透查',
                     'icon': 'ti:list-details:outline',
                     'options': {'color': 'teal'},
                     'context': {'url': '/plugin/weiti_mdm/build-table/%s/'
@@ -1354,7 +1354,7 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
         except Exception:
             qty = D('1')
 
-        # bo=<pk>：从物料穿透页"去采购"进入，生成的 PO 关联该生产单
+        # bo=<pk>：从物料透查页"去采购"进入，生成的 PO 关联该生产单
         from build.models import Build
         src_bo = None
         bo_pk = request.POST.get('bo') or request.GET.get('bo')
@@ -1364,51 +1364,70 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             except (Build.DoesNotExist, ValueError):
                 src_bo = None
 
+        from build.status_codes import BuildStatusGroups
+        closed_bo = bool(src_bo) and (
+            src_bo.status not in BuildStatusGroups.ACTIVE_CODES)
         created = None
+        blocked = False
         if request.method == 'POST' and request.POST.get('action') == 'create':
-            buy0, _ = orderflow.collect_bom_purchasables(
-                part, qty, net_open=True)
-            # 读取每行选定的供应商零件（sp_<part_pk>=<sp_pk>）
-            from company.models import SupplierPart
-            for e in buy0:
-                sp_pk = request.POST.get('sp_%s' % e['part'].pk)
-                if sp_pk:
-                    try:
-                        e['sp'] = SupplierPart.objects.get(pk=sp_pk)
-                    except SupplierPart.DoesNotExist:
-                        pass
-            if src_bo:
-                created = orderflow._create_po_lines(
-                    self, buy0, src_bo,
-                    getattr(src_bo, 'target_date', None)
-                    or orderflow._today())
+            if closed_bo:
+                blocked = True  # 已取消/已完成的 BO 不允许再建 PO
             else:
-                created = orderflow.create_pos_for_part(self, buy0, part)
+                buy0, _ = orderflow.collect_bom_purchasables(
+                    part, qty, net_open=True, source=src_bo)
+                # 读取每行选定的供应商零件（sp_<part_pk>=<sp_pk>）
+                from company.models import SupplierPart
+                for e in buy0:
+                    sp_pk = request.POST.get('sp_%s' % e['part'].pk)
+                    if sp_pk:
+                        try:
+                            e['sp'] = SupplierPart.objects.get(pk=sp_pk)
+                        except SupplierPart.DoesNotExist:
+                            pass
+                if src_bo:
+                    created = orderflow._create_po_lines(
+                        self, buy0, src_bo,
+                        getattr(src_bo, 'target_date', None)
+                        or orderflow._today())
+                else:
+                    created = orderflow.create_pos_for_part(
+                        self, buy0, part)
 
         # 展示态：建单后重新收集（刚建的 PO 计入在途，行自动移入跳过项）
         # net_open：供给池先偿还其它开放订单已承诺的需求，再算本单缺口
         buy, skipped = orderflow.collect_bom_purchasables(
-            part, qty, net_open=True)
-        # 需采购/跳过项都补在途/在产单号，便于溯源
+            part, qty, net_open=True, source=src_bo)
+        # 需采购/跳过项都补在途/在产单号，便于溯源。
+        # 有来源BO时按本单专属口径：只列关联本单家族的PO/BO，
+        # 全局量另存 on_order_all/building_all 作对比提示
         from order.models import PurchaseOrderLineItem
         from order.status_codes import PurchaseOrderStatusGroups
         from build.models import Build
         from build.status_codes import BuildStatusGroups
         for s in list(buy) + skipped:
             p = s['part']
-            s['pos'] = (
-                PurchaseOrderLineItem.objects
-                .filter(part__part=p,
-                        order__status__in=PurchaseOrderStatusGroups.OPEN)
-                .values_list('order__pk', 'order__reference')
-                .distinct())
-            s['bos'] = (Build.objects
-                        .filter(part=p,
-                                status__in=BuildStatusGroups.ACTIVE_CODES)
-                        .values_list('pk', 'reference'))
+            if src_bo:
+                s['pos'] = s.get('own_pos') or []
+                s['bos'] = s.get('own_bos') or []
+            else:
+                s['pos'] = (
+                    PurchaseOrderLineItem.objects
+                    .filter(
+                        part__part=p,
+                        order__status__in=PurchaseOrderStatusGroups
+                        .OPEN)
+                    .values_list('order__pk', 'order__reference')
+                    .distinct())
+                s['bos'] = (Build.objects
+                            .filter(
+                                part=p,
+                                status__in=BuildStatusGroups
+                                .ACTIVE_CODES)
+                            .values_list('pk', 'reference'))
         ctx = {'part': part, 'qty': qty, 'buy': buy,
                'skipped': skipped, 'created': created,
-               'src_bo': src_bo}
+               'src_bo': src_bo, 'closed_bo': closed_bo,
+               'blocked': blocked}
         return self._render(request, 'part_po.html', ctx)
 
     # ---------- 物料明细总表（摊平到叶子件） ----------
@@ -1502,7 +1521,7 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
         ctx = {'part': part, 'qty': qty, 'rows': rows}
         return self._render(request, 'part_table.html', ctx)
 
-    # ---------- 生产单物料穿透（物料 + 关联订单） ----------
+    # ---------- 生产单物料透查（物料 + 关联订单） ----------
 
     def view_build_table(self, request, pk):
         """生产单物料树：递归展开 BOM 到叶子层（缩进表示父子），
@@ -1520,6 +1539,35 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             bo = Build.objects.get(pk=pk)
         except Build.DoesNotExist:
             return HttpResponse('生产单不存在', status=404)
+
+        from build.status_codes import BuildStatusGroups
+        closed = bo.status not in BuildStatusGroups.ACTIVE_CODES
+
+        # 行内选好供应商后一键建 PO（全部缺料叶子件）；
+        # 已取消/已完成的 BO 只读，不再生成任何单据
+        created_pos = []
+        blocked = False
+        if (request.method == 'POST'
+                and request.POST.get('action') == 'create_pos'):
+            if closed:
+                blocked = True
+            else:
+                from company.models import SupplierPart
+                buy0, _ = orderflow.collect_bom_purchasables(
+                    bo.part, D(str(bo.quantity)),
+                    net_open=True, source=bo)
+                for e in buy0:
+                    sp_pk = request.POST.get('sp_%s' % e['part'].pk)
+                    if sp_pk:
+                        try:
+                            e['sp'] = SupplierPart.objects.get(pk=sp_pk)
+                        except SupplierPart.DoesNotExist:
+                            pass
+                created_pos = orderflow._create_po_lines(
+                    self, buy0, bo,
+                    getattr(bo, 'target_date', None)
+                    or orderflow._today())
+            # 生成后页面自然重算，已覆盖的行自动消失
 
         # 关联本BO（含子孙BO）的采购单集合
         tag = 'Build:%s' % pk
@@ -1597,6 +1645,7 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                     'part': sub, 'need': need,
                     'is_assembly': is_assembly,
                     'stock': stock,
+                    'linked_in': linked_in,
                     'gap': max(gap, D(0)),
                     'img': sub.image.url if sub.image else '',
                     'child_bos': cbos,
@@ -1605,6 +1654,57 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                     walk(sub, need, depth + 1, path | {sub.pk})
 
         walk(bo.part, D(str(bo.quantity)), 0, {bo.part.pk})
+
+        # 本单专属净额缺口（与 part_po 页同一口径）：
+        #   在途 = 关联本单家族的采购行未收量；
+        #   在产 = 关联本单家族的活跃生产单未完成量；
+        #   已承诺 = 其它开放订单的需求（本单家族剔除），只吃共享库存；
+        #   缺口 = 需求 − 关联在途 − 关联在产 − max(0, 库存 − 已承诺)
+        # 展示缺口即净缺口，与"去采购/建子单"建议数量一致。
+        excl = orderflow._source_demand_keys(bo)
+        shortages = {}
+        try:
+            for s in orderflow.collect_shortages():
+                own = sum(
+                    D(str(d['qty'])) for d in s.get('demands', [])
+                    if (d.get('kind'), d.get('pk')) in excl)
+                shortages[s['part'].pk] = (D(str(s['need'])), own)
+        except Exception:
+            pass
+        lb_map = orderflow._linked_builds(bo)
+        for r in rows:
+            r['free_in'] = D(0)
+            part = r['part']
+            stock = D(str(part.available_stock or 0))
+            on_order = D(str(getattr(part, 'on_order', 0) or 0))
+            building = D(str(getattr(part, 'quantity_being_built', 0)
+                             or 0))
+            tot, own = shortages.get(part.pk, (None, D(0)))
+            others = (tot - own) if tot is not None else D(0)
+            others = max(others, D(0))
+            # 可用库存 = 实物库存 − 其它订单已承诺（本单真能分到的）
+            r['stock_avail'] = max(D(0), stock - others)
+            r['others'] = others
+            # 全局自由供给提示（仅展示）：非本单在途/在产减去吃承诺的部分
+            r['free_in'] = max(
+                D(0), on_order + building - max(D(0), others - stock))
+            # 关联供给：叶子=关联PO未收+关联在产；装配=子BO未完成
+            own_supply = r['linked_in']
+            if not r['is_assembly']:
+                own_supply += lb_map.get(part.pk, {}).get('qty', D(0))
+            else:
+                own_supply = max(
+                    own_supply, lb_map.get(part.pk, {}).get('qty', D(0)))
+            # 自由供给：共享库存 + 非本单在途/在产，先偿还其它订单
+            # 已承诺，剩余才抵扣——自有供给全额抵扣，刚好够买不超采
+            non_own = max(D(0), on_order + building - own_supply)
+            free = max(D(0), stock + non_own - others)
+            net = max(D(0), r['need'] - own_supply - free)
+            r['buy_qty'] = net
+            r['gap'] = net
+            if net > 0 and not r['is_assembly']:
+                r['sp_opts'] = orderflow._supplier_candidates(
+                    part, net)
 
         # 上游来源链：直接来源 + 最上游归属（metadata），
         # 元数据缺失时退回原生 parent / sales_order 外键
@@ -1634,11 +1734,16 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                     'url': '/web/manufacturing/build-order/%s/'
                            % bo.parent_id})
 
-        ctx = {'bo': bo, 'rows': rows, 'upstream': upstream}
+        has_buy = any(
+            (not r['is_assembly']) and r.get('buy_qty', D(0)) > 0
+            for r in rows)
+        ctx = {'bo': bo, 'rows': rows, 'upstream': upstream,
+               'has_buy': has_buy, 'created_pos': created_pos,
+               'closed': closed, 'blocked': blocked}
         return self._render(request, 'build_table.html', ctx)
 
     def view_build_spawn(self, request, pk, ppk):
-        """物料穿透页"建子生产单"：为缺料装配行建关联本BO的子BO。
+        """物料透查页"建子生产单"：为缺料装配行建关联本BO的子BO。
 
         子BO parent=本BO、weiti_source=Build:本BO；Build post_save
         触发 task_check_build，子BO自身缺料继续级联建更下游单。
@@ -1654,6 +1759,10 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
         from part.models import Part
         import orderflow
         bo = Build.objects.get(pk=pk)
+        from build.status_codes import BuildStatusGroups
+        if bo.status not in BuildStatusGroups.ACTIVE_CODES:
+            return HttpResponseForbidden(
+                '生产单已取消/已完成，不可再建子生产单')
         sub = Part.objects.get(pk=ppk)
         try:
             qty = D(request.POST.get('qty') or '0')
@@ -1694,8 +1803,13 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
         except cls.DoesNotExist:
             return HttpResponse('订单不存在', status=404)
         import orderflow
-        ctx = {'order': order, 'kind': kind,
-               'rows': orderflow.order_trace(order)}
+        rows = orderflow.order_trace(order)
+        url_tpl = orderflow._SRC_URLS.get(order.__class__.__name__, '')
+        # 手工采购单：无来源标签 → 穿透只有它自己（提示无法追溯上游）
+        single_manual = (kind == 'purchaseorder' and len(rows) <= 1)
+        ctx = {'order': order, 'kind': kind, 'rows': rows,
+               'single_manual': single_manual,
+               'order_url': url_tpl % order.pk if url_tpl else ''}
         return self._render(request, 'trace.html', ctx)
 
     # ---------- 排单看板 ----------
@@ -1998,18 +2112,36 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
         return (Part.objects.filter(IPN=key).first()
                 or Part.objects.filter(name=key).first())
 
-    def _render(self, request, template_name, ctx):
-        """从插件目录直接读模板渲染——不依赖 Django app 模板发现机制。
+    _tpl_engine = None
 
-        插件目录不在 INSTALLED_APPS 里，render() 的模板加载器找不到
-        templates/ 下的文件，所以这里手动读文件 + RequestContext 渲染
-        （RequestContext 提供 csrf_token 等上下文处理器变量）。
+    def _get_engine(self):
+        """独立模板 Engine，DIRS 指向插件 templates/——支持 extends/include。
+
+        插件目录不在 INSTALLED_APPS，用专属 Engine（文件系统加载器）
+        才能让各页 {% extends 'weiti_base.html' %} 共用母版皮肤。
         """
+        if WeiTiMDMPlugin._tpl_engine is None:
+            from django.template import Engine
+            tpl_dir = os.path.join(PLUGIN_DIR, 'templates')
+            WeiTiMDMPlugin._tpl_engine = Engine(
+                dirs=[tpl_dir],
+                context_processors=[
+                    'django.template.context_processors.csrf',
+                    'django.template.context_processors.request',
+                ],
+                builtins=['django.template.defaulttags',
+                          'django.template.defaultfilters',
+                          'django.template.loader_tags'],
+                libraries={},
+            )
+        return WeiTiMDMPlugin._tpl_engine
+
+    def _render(self, request, template_name, ctx):
+        """从插件目录渲染模板（RequestContext 提供 csrf_token 等）。"""
         from django.http import HttpResponse
-        from django.template import RequestContext, Template
-        path = os.path.join(PLUGIN_DIR, 'templates', template_name)
-        with open(path, encoding='utf-8') as f:
-            tpl = Template(f.read())
+        from django.template import RequestContext
+        engine = self._get_engine()
+        tpl = engine.get_template(template_name)
         return HttpResponse(tpl.render(RequestContext(request, ctx)))
 
     def view_bom_import(self, request):

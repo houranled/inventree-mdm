@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}微体物料{% endblock %}</title>
+  <style>
+    :root {
+      --brand: #1e6ff2; --brand-d: #1552c4;
+      --bg: #f4f6fa; --card: #fff; --line: #e6e9ef;
+      --ink: #2b2f38; --muted: #8a92a3; --head: #f7f9fc;
+      --ok: #12855f; --warn: #c98a00; --bad: #d23f3f;
+      --asm: #eef4ff; --short: #fff6f6;
+    }
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei",
+             system-ui, sans-serif;
+           margin: 0; background: var(--bg); color: var(--ink);
+           font-size: 13px; line-height: 1.5; }
+    a { color: var(--brand); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .topbar { background: linear-gradient(90deg, #1e6ff2, #2f6feb);
+              color: #fff; padding: 14px 28px; display: flex;
+              align-items: center; gap: 12px; }
+    .topbar .logo { width: 26px; height: 26px; border-radius: 6px;
+                    background: rgba(255,255,255,.22); display: flex;
+                    align-items: center; justify-content: center;
+                    font-weight: 700; font-size: 14px; }
+    .topbar .brand { font-weight: 600; font-size: 15px; }
+    .topbar .sub { color: rgba(255,255,255,.8); font-size: 12px; }
+    .wrap { max-width: 1440px; margin: 22px auto; padding: 0 20px; }
+    .card { background: var(--card); border: 1px solid var(--line);
+            border-radius: 10px; padding: 20px 22px;
+            box-shadow: 0 1px 3px rgba(20,30,60,.04); }
+    h1 { font-size: 19px; margin: 0 0 4px; font-weight: 650; }
+    h1 .meta { color: var(--muted); font-size: 13px; font-weight: 400;
+               margin-left: 8px; }
+    .hint { color: var(--muted); font-size: 12.5px; margin: 6px 0 0; }
+    .crumbs { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+    .crumbs a { color: var(--muted); }
+    table { border-collapse: collapse; width: 100%; margin-top: 14px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 9px 11px;
+             text-align: left; vertical-align: middle; }
+    th { background: var(--head); white-space: nowrap; color: #5b6373;
+         font-weight: 600; font-size: 12px; position: sticky; top: 0;
+         border-bottom: 1px solid var(--line); }
+    tbody tr:hover td { background: #fafbfe; }
+    .ipn { font-family: ui-monospace, "SF Mono", Consolas, monospace;
+           font-size: 12px; color: #55607a; }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .gap { color: var(--bad); font-weight: 700; }
+    .ok { color: var(--ok); font-weight: 600; }
+    .muted { color: var(--muted); }
+    img.thumb { width: 34px; height: 34px; object-fit: cover;
+                border-radius: 5px; border: 1px solid var(--line);
+                vertical-align: middle; }
+    .badge { display: inline-block; padding: 1px 9px; border-radius: 20px;
+             font-size: 11.5px; background: #eef1f6; color: #55607a;
+             font-weight: 500; }
+    .tag { display: inline-block; padding: 1px 8px; border-radius: 4px;
+           font-size: 11px; font-weight: 600; margin-left: 6px; }
+    .tag-asm { background: #dce8ff; color: #1552c4; }
+    .pill-btn { display: inline-block; padding: 3px 12px; font-size: 12px;
+                cursor: pointer; color: #fff; background: var(--ok);
+                border: none; border-radius: 6px; font-weight: 600;
+                margin-top: 4px; }
+    .pill-btn:hover { filter: brightness(1.06); }
+    .buy-link { display: inline-block; margin-top: 4px; color: var(--bad);
+                font-weight: 700; font-size: 12px; }
+    .foot { margin-top: 18px; padding-top: 14px;
+            border-top: 1px solid var(--line); color: var(--muted);
+            font-size: 12.5px; display: flex; gap: 16px; flex-wrap: wrap; }
+    .btn { display: inline-flex; align-items: center; gap: 6px;
+           padding: 7px 16px; border-radius: 7px; border: 1px solid var(--line);
+           background: #fff; color: var(--ink); cursor: pointer;
+           font-size: 13px; }
+    .btn-primary { background: var(--brand); color: #fff;
+                   border-color: var(--brand); }
+    .btn-primary:hover { background: var(--brand-d); text-decoration: none; }
+    input[type=number], input[type=text], select {
+      padding: 6px 9px; border: 1px solid var(--line); border-radius: 6px;
+      font-size: 13px; }
+    .row-asm td { background: var(--asm); }
+    .row-short td { background: var(--short); }
+    .po { margin: 2px 0; }
+  </style>
+  {% block extra_style %}{% endblock %}
+</head>
+<body>
+  <div class="topbar">
+    <div class="logo">微</div>
+    <div>
+      <div class="brand">微体物料主数据</div>
+      <div class="sub">{% block subtitle %}物料 · 采购 · 生产协同{% endblock %}</div>
+    </div>
+  </div>
+  <div class="wrap">
+    <div class="card">
+      {% block body %}{% endblock %}
+    </div>
+  </div>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

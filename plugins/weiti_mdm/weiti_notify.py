@@ -71,13 +71,13 @@ def send_inapp(order, users, title, message):
 
 
 def send_wecom(plugin, content):
-    """企业微信群机器人 markdown 消息。"""
+    """企业微信群机器人纯文本消息（不渲染 markdown，URL 直接可见）。"""
     url = (plugin.get_setting('OF_WECOM_WEBHOOK') or '').strip()
     if not url:
         return
     body = json.dumps({
-        'msgtype': 'markdown',
-        'markdown': {'content': content},
+        'msgtype': 'text',
+        'text': {'content': content},
     }).encode('utf-8')
     try:
         req = urllib.request.Request(
@@ -121,11 +121,11 @@ def notify_kitted(plugin, order, kind):
     title = '%s %s 已齐套' % (label, ref)
     msg = '全部物料库存充足，可以下达/发货'
     send_inapp(order, users, title, msg)
-    content = '### %s\n> 订单：**%s**\n> 状态：已齐套，可开工' % (title, ref)
+    lines = [title, '订单：%s' % ref, '状态：已齐套，可开工']
     base = _site_base(plugin)
     if base:
-        content += '\n> [点击查看订单](%s%s)' % (base, _order_url(order))
-    send_wecom(plugin, content)
+        lines.append('链接：%s%s' % (base, _order_url(order)))
+    send_wecom(plugin, '\n'.join(lines))
     logger.info('WeiTiMDM: %s 齐套通知已发 (收件 %d 人)', ref, len(users))
 
 
@@ -152,20 +152,28 @@ def _notify_created(plugin, source, orders, group_key, label):
     users = collect_recipients(plugin, source, group_key)
     n = len(orders)
     refs = '、'.join(getattr(o, 'reference', str(o.pk)) for o in orders)
-    title = '自动生成 %d 张%s待确认' % (n, label)
-    msg = '来源：%s；单号：%s' % (src, refs)
+    # 子BO自动下达 → 文案报"已下达"；PENDING 的报"待确认"
+    state, tail = '待确认', '请核对后下达。'
+    if label == '生产单':
+        try:
+            from build.status_codes import BuildStatus
+            if all(o.status == BuildStatus.PRODUCTION for o in orders):
+                state, tail = '已下达', '已进入生产。'
+        except Exception:
+            pass
+    title = '自动生成 %d 张 %s %s（来源：%s）' % (n, label, state, src)
+    msg = '单号：%s' % refs
     target = orders[0] if orders else source
     send_inapp(target, users, title, msg)
     base = _site_base(plugin)
-    lines = ['### %s' % title, '> 来源：**%s**' % src]
+    lines = [title]
     for o in orders:
         sup = getattr(getattr(o, 'supplier', None), 'name', '')
-        ln = '- **%s**%s' % (
-            o.reference, '（%s）' % sup if sup else '')
+        ln = '- %s%s' % (o.reference, '（%s）' % sup if sup else '')
         if base:
-            ln += ' [查看](%s%s)' % (base, _order_url(o))
+            ln += ' %s%s' % (base, _order_url(o))
         lines.append(ln)
-    lines.append('> 请核对后下达。')
+    lines.append(tail)
     send_wecom(plugin, '\n'.join(lines))
     logger.info('WeiTiMDM: %s → 自动建单通知已发 %s (收件 %d 人)',
                 src, refs, len(users))
