@@ -841,6 +841,11 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             'name': '优先级·传导权重',
             'description': 'BO 继承其来源 SO 紧急度的权重(0~1)',
             'validator': float, 'default': 0.5},
+        'ACCESS_GROUPS': {
+            'name': '允许访问的组',
+            'description': '逗号分隔的用户组名（如 采购,工程）；'
+                           'staff 始终可访问，留空则仅 staff',
+            'default': ''},
     }
 
     # ---------------- 定时任务（每日重算优先级+齐套） ----------------
@@ -944,10 +949,10 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                  name='schedule-board'),
             path('part-po/<int:pk>/', self.view_part_po,
                  name='part-po'),
-            path('part-table/<int:pk>/', self.view_part_table,
-                 name='part-table'),
             path('build-table/<int:pk>/', self.view_build_table,
                  name='build-table'),
+            path('so-table/<int:pk>/', self.view_so_table,
+                 name='so-table'),
             path('build-table/<int:pk>/spawn/<int:ppk>/',
                  self.view_build_spawn, name='build-spawn'),
             path('shortages/', self.view_shortages,
@@ -981,6 +986,24 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                     'options': {'color': 'teal'},
                     'context': {'url': '/plugin/weiti_mdm/build-table/%s/'
                                 % mo.group(2)},
+                    'source': '/plugin/weiti_mdm/bom-import.js',
+                }]
+            elif mo.group(1) == 'sales-order':
+                oactions = [{
+                    'key': 'weiti-so-table',
+                    'title': '物料透查',
+                    'icon': 'ti:list-details:outline',
+                    'options': {'color': 'teal'},
+                    'context': {'url': '/plugin/weiti_mdm/so-table/%s/'
+                                % mo.group(2)},
+                    'source': '/plugin/weiti_mdm/bom-import.js',
+                }, {
+                    'key': 'weiti-order-trace',
+                    'title': '订单穿透',
+                    'icon': 'ti:binary-tree:outline',
+                    'options': {'color': 'violet'},
+                    'context': {'url': '/plugin/weiti_mdm/trace/%s/%s/' % (
+                        kmap[mo.group(1)], mo.group(2))},
                     'source': '/plugin/weiti_mdm/bom-import.js',
                 }]
             else:
@@ -1034,14 +1057,6 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                 'context': {'url': f'/plugin/weiti_mdm/part-po/{pk}/'},
                 'source': '/plugin/weiti_mdm/bom-import.js',
             })
-            actions.append({
-                'key': 'weiti-part-table',
-                'title': '物料总表',
-                'icon': 'ti:table:outline',
-                'options': {'color': 'cyan'},
-                'context': {'url': f'/plugin/weiti_mdm/part-table/{pk}/'},
-                'source': '/plugin/weiti_mdm/bom-import.js',
-            })
             # 子件里有装配体 → 再加"导出BOM树"（多 tab 整树导出）
             try:
                 from part.models import BomItem
@@ -1065,9 +1080,24 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
     # 注意：navigation 特性的 options.url 只支持 SPA 内部路由，指向插件
     # Django 页面会被前端拼成 /web/plugin/... 而 404，故不用 navigation。
 
+    def _page_allowed(self, request):
+        """插件页面/入口的统一门禁：staff 或 ACCESS_GROUPS 组成员。"""
+        u = request.user
+        if not (u and u.is_authenticated):
+            return False
+        if u.is_staff:
+            return True
+        try:
+            names = [n.strip() for n in (
+                self.get_setting('ACCESS_GROUPS') or '').split(',')
+                if n.strip()]
+        except Exception:
+            names = []
+        return bool(names) and u.groups.filter(name__in=names).exists()
+
     def get_ui_spotlight_actions(self, request, context, **kwargs):
         """Spotlight 动作：executeAction 里 window.location.href 整页跳。"""
-        if not (request.user and request.user.is_staff):
+        if not self._page_allowed(request):
             return []
         src = '/plugin/weiti_mdm/bom-import.js'
         return [{
@@ -1116,7 +1146,7 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
         反向：PO 详情页 → "来源订单"跳回生成它的 BO/SO。
         context 为 QueryDict：target_model + target_id。
         """
-        if not (request.user and request.user.is_staff):
+        if not self._page_allowed(request):
             return []
         context = context or {}
         model, pk = context.get('target_model'), context.get('target_id')
@@ -1210,31 +1240,6 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                         'icon': 'ti:building-store:outline',
                         'context': {'orders': orders},
                         'source': src})
-                # 物料总表：摊平到叶子件的简表面板
-                from part.models import Part
-                part = Part.objects.get(pk=pk)
-                if part.bom_items.exists():
-                    import orderflow
-                    rows = []
-                    for e in orderflow.collect_bom_leaves(part, 1):
-                        p = e['part']
-                        rows.append({
-                            'pk': p.pk, 'ipn': p.IPN or '', 'name': p.name,
-                            'need': str(e['need']),
-                            'stock': str(p.available_stock or 0),
-                            'on_order': str(getattr(p, 'on_order', 0) or 0),
-                            'gap': str(orderflow._uncovered(p, e['need']))})
-                    if rows:
-                        panels.append({
-                            'key': 'weiti-part-table',
-                            'title': '物料总表',
-                            'icon': 'ti:table:outline',
-                            'context': {
-                                'rows': rows,
-                                'full_url': '/plugin/weiti_mdm/part-table/'
-                                            '%s/' % pk},
-                            'source': '/plugin/weiti_mdm/bom-import.js'
-                                      ':renderPartTablePanel'})
         except Exception:
             pass
         return panels
@@ -1243,7 +1248,7 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
 
     def get_ui_dashboard_items(self, request, context, **kwargs):
         """仪表盘卡片：工具入口 + 待完善编码计数。"""
-        if not (request.user and request.user.is_staff):
+        if not self._page_allowed(request):
             return []
         pending = 0
         try:
@@ -1313,8 +1318,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
     def view_pending_parts(self, request):
         """IPN 以 ! 开头的零件清单：IPN/名称/类别/参数填写进度。"""
         from django.http import HttpResponseForbidden
-        if not (request.user.is_authenticated and request.user.is_staff):
-            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        if not self._page_allowed(request):
+            return HttpResponseForbidden('无权访问：需员工身份或授权组成员')
         from part.models import Part
         rows = []
         for p in (Part.objects.filter(IPN__startswith='!')
@@ -1341,8 +1346,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
         from part.models import Part
         import orderflow
 
-        if not (request.user.is_authenticated and request.user.is_staff):
-            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        if not self._page_allowed(request):
+            return HttpResponseForbidden('无权访问：需员工身份或授权组成员')
         try:
             part = Part.objects.get(pk=pk)
         except Part.DoesNotExist:
@@ -1430,97 +1435,6 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                'blocked': blocked}
         return self._render(request, 'part_po.html', ctx)
 
-    # ---------- 物料明细总表（摊平到叶子件） ----------
-
-    def view_part_table(self, request, pk):
-        """整机物料明细总表：摊平到叶子件，合并工程/库存/采购列。"""
-        from decimal import Decimal as D
-        from django.http import HttpResponse, HttpResponseForbidden
-        from part.models import Part
-        import orderflow
-
-        if not (request.user.is_authenticated and request.user.is_staff):
-            return HttpResponseForbidden('需要以员工(staff)身份登录')
-        try:
-            part = Part.objects.get(pk=pk)
-        except Part.DoesNotExist:
-            return HttpResponse('零件不存在', status=404)
-
-        try:
-            qty = D(request.GET.get('qty') or '1')
-        except Exception:
-            qty = D('1')
-
-        from order.models import PurchaseOrderLineItem
-        from order.status_codes import PurchaseOrderStatusGroups
-        from build.models import Build
-        from build.status_codes import BuildStatusGroups
-
-        rows = []
-        for e in orderflow.collect_bom_leaves(part, qty):
-            p, need = e['part'], e['need']
-            # 规格参数拼接；材质/工艺类字段拆成独立列
-            spec_parts, material, process = [], [], []
-            try:
-                for x in p.parameters.select_related('template').all():
-                    v = str(x.data or '').strip()
-                    if not v:
-                        continue
-                    name = x.template.name
-                    if '材质' in name:
-                        material.append(v)
-                    elif '工艺' in name or '表面' in name:
-                        process.append(v)
-                    else:
-                        spec_parts.append('%s=%s' % (name, v))
-            except Exception:
-                pass
-            spec = '；'.join(spec_parts)
-            # 供应商：按需求数量取最低价（复用采购行逻辑）
-            sp = orderflow._pick_supplier_part(p, need)
-            price, lead = None, ''
-            if sp:
-                try:
-                    price = sp.get_price(need)
-                except Exception:
-                    price = None
-                lead = (sp.metadata or {}).get('lead_time_days', '') or ''
-            pos = (PurchaseOrderLineItem.objects
-                   .filter(part__part=p,
-                           order__status__in=PurchaseOrderStatusGroups.OPEN)
-                   .values_list('order__pk', 'order__reference')
-                   .distinct())
-            bos = (Build.objects
-                   .filter(part=p,
-                           status__in=BuildStatusGroups.ACTIVE_CODES)
-                   .values_list('pk', 'reference'))
-            stock = p.available_stock or 0
-            on_order = getattr(p, 'on_order', 0) or 0
-            building = getattr(p, 'quantity_being_built', 0) or 0
-            gap = orderflow._uncovered(p, need)
-            unit = (e['need'] / qty) if qty else e['need']
-            rows.append({
-                'part': p, 'qty': unit, 'need': need, 'spec': spec,
-                'material': '；'.join(material),
-                'process': '；'.join(process),
-                'usage': e.get('usage', ''),
-                'img': p.image.url if p.image else '',
-                'stock': stock, 'on_order': on_order,
-                'building': building, 'gap': gap,
-                'supplier': str(sp.supplier.name) if sp else '',
-                'sku': (sp.SKU or '') if sp else '',
-                'price': price, 'lead': lead,
-                'pos': pos, 'bos': bos,
-                'attachments': [
-                    {'name': a.basename or a.link or '附件',
-                     'url': a.attachment.url if a.attachment
-                     else (a.link or '')}
-                    for a in p.attachments.all()[:3]
-                    if getattr(a, 'attachment', None)
-                    or getattr(a, 'link', None)]})
-        ctx = {'part': part, 'qty': qty, 'rows': rows}
-        return self._render(request, 'part_table.html', ctx)
-
     # ---------- 生产单物料透查（物料 + 关联订单） ----------
 
     def view_build_table(self, request, pk):
@@ -1533,8 +1447,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
         from order.models import PurchaseOrder, PurchaseOrderLineItem
         import orderflow
 
-        if not (request.user.is_authenticated and request.user.is_staff):
-            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        if not self._page_allowed(request):
+            return HttpResponseForbidden('无权访问：需员工身份或授权组成员')
         try:
             bo = Build.objects.get(pk=pk)
         except Build.DoesNotExist:
@@ -1751,8 +1665,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
         from decimal import Decimal as D
         from django.http import HttpResponseForbidden
         from django.shortcuts import redirect
-        if not (request.user.is_authenticated and request.user.is_staff):
-            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        if not self._page_allowed(request):
+            return HttpResponseForbidden('无权访问：需员工身份或授权组成员')
         if request.method != 'POST':
             return redirect('/plugin/weiti_mdm/build-table/%s/' % pk)
         from build.models import Build
@@ -1775,13 +1689,183 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             getattr(bo, 'target_date', None) or orderflow._today())
         return redirect('/plugin/weiti_mdm/build-table/%s/' % pk)
 
+    # ---------- 销售单物料透查 ----------
+
+    def view_so_table(self, request, pk):
+        """销售单物料透查：每行订单行下钻 BOM 到叶子件，
+        按 SO 家族口径（SO + 其全部子孙 BO）算供需缺口。
+
+        叶子件缺口可本页选供应商确认建 PO（weiti_source=SalesOrder，
+        该标签也被 BO 透查页认作本家族关联在途）；
+        装配行显示关联生产单，可跳到 BO 透查页继续处理。"""
+        from django.http import HttpResponse, HttpResponseForbidden
+        from decimal import Decimal as D
+        from order.models import SalesOrder
+        from order.status_codes import SalesOrderStatusGroups
+        import orderflow
+
+        if not self._page_allowed(request):
+            return HttpResponseForbidden('无权访问：需员工身份或授权组成员')
+        try:
+            so = SalesOrder.objects.get(pk=pk)
+        except SalesOrder.DoesNotExist:
+            return HttpResponse('销售单不存在', status=404)
+
+        closed = so.status not in SalesOrderStatusGroups.OPEN
+        need_by = (getattr(so, 'target_date', None)
+                   or orderflow._today())
+
+        excl = orderflow._source_demand_keys(so)
+        shortages = {}
+        try:
+            for s in orderflow.collect_shortages():
+                own = sum(
+                    D(str(d['qty'])) for d in s.get('demands', [])
+                    if (d.get('kind'), d.get('pk')) in excl)
+                shortages[s['part'].pk] = (D(str(s['need'])), own)
+        except Exception:
+            pass
+
+        def build_rows():
+            lb_map = orderflow._linked_builds(so)
+            lp_map = orderflow._linked_pos(so)
+            bo_pks = [bp for rec in lb_map.values()
+                      for bp, _ in rec['bos']]
+            bo_info = {}
+            if bo_pks:
+                from build.models import Build
+                for b in Build.objects.filter(pk__in=bo_pks):
+                    bo_info[b.pk] = {
+                        'status': (b.get_status_display()
+                                   if hasattr(b, 'get_status_display')
+                                   else ''),
+                        'qty': D(str(b.quantity)),
+                        'remain': D(str(b.quantity)) - D(
+                            str(getattr(b, 'completed', 0) or 0))}
+            rows = []
+
+            def mk_row(part, need, is_asm, depth, is_line=False):
+                stock = D(str(part.available_stock or 0))
+                on_order = D(str(getattr(part, 'on_order', 0) or 0))
+                building = D(str(
+                    getattr(part, 'quantity_being_built', 0) or 0))
+                tot, own = shortages.get(part.pk, (D(0), D(0)))
+                others = max(D(0), tot - own)
+                child_bos, polines = [], []
+                if is_asm:
+                    rec = lb_map.get(part.pk, {})
+                    own_supply = D(str(rec.get('qty', 0)))
+                    for bp, ref in rec.get('bos', []):
+                        child_bos.append(
+                            {'pk': bp, 'ref': ref,
+                             **bo_info.get(bp, {})})
+                else:
+                    rec = lp_map.get(part.pk, {})
+                    own_supply = D(str(rec.get('qty', 0)))
+                    polines = [{'pk': op, 'ref': ref}
+                               for op, ref in rec.get('pos', [])]
+                    # 叶子件也可能有关联在产（自制件）
+                    own_supply += D(str(
+                        lb_map.get(part.pk, {}).get('qty', 0)))
+                non_own = max(
+                    D(0), on_order + building - own_supply)
+                free = max(D(0), stock + non_own - others)
+                net = max(D(0), need - own_supply - free)
+                row = {
+                    'is_line': is_line,
+                    'depth': depth, 'd': min(depth, 8),
+                    'part': part, 'need': need,
+                    'is_assembly': is_asm,
+                    'stock': stock, 'stock_avail': max(
+                        D(0), stock - others),
+                    'others': others,
+                    'free_in': non_own,
+                    'own_supply': own_supply,
+                    'gap': net, 'buy_qty': net,
+                    'child_bos': child_bos, 'polines': polines,
+                    'img': (part.image.url if part.image else '')}
+                if net > 0 and not is_asm and not closed:
+                    row['sp_opts'] = orderflow._supplier_candidates(
+                        part, net)
+                return row
+
+            def walk(part, factor, depth, path):
+                for it in (part.bom_items
+                           .select_related('sub_part').all()):
+                    sub = it.sub_part
+                    if not sub or sub.pk in path:
+                        continue
+                    n = D(str(it.quantity)) * factor
+                    is_asm = sub.bom_items.exists()
+                    rows.append(mk_row(sub, n, is_asm, depth))
+                    if is_asm:
+                        walk(sub, n, depth + 1, path | {sub.pk})
+
+            for line in so.lines.select_related('part').all():
+                part = line.part
+                if not part:
+                    continue
+                qty = D(str(line.quantity))
+                shipped = D(str(line.shipped))
+                try:
+                    alloc = D(str(line.allocated_quantity()))
+                except Exception:
+                    alloc = D(0)
+                need = max(D(0), qty - shipped - alloc)
+                is_asm = part.bom_items.exists()
+                row = mk_row(part, need, is_asm, 0, is_line=True)
+                row.update({'qty': qty, 'shipped': shipped,
+                            'alloc': alloc})
+                rows.append(row)
+                if is_asm and need > 0:
+                    walk(part, need, 1, {part.pk})
+            return rows
+
+        # 行内选好供应商后一键建 PO（全部缺料叶子件）；
+        # 已发货/已取消的 SO 只读，不再生成任何单据
+        created_pos = []
+        blocked = False
+        if (request.method == 'POST'
+                and request.POST.get('action') == 'create_pos'):
+            if closed:
+                blocked = True
+            else:
+                from company.models import SupplierPart
+                items = []
+                for r in build_rows():
+                    if r['is_assembly'] or r['buy_qty'] <= 0:
+                        continue
+                    e = {'part': r['part'], 'qty': r['buy_qty']}
+                    sp_pk = request.POST.get(
+                        'sp_%s' % r['part'].pk)
+                    if sp_pk:
+                        try:
+                            e['sp'] = SupplierPart.objects.get(
+                                pk=sp_pk)
+                        except SupplierPart.DoesNotExist:
+                            pass
+                    items.append(e)
+                if items:
+                    created_pos = orderflow._create_po_lines(
+                        self, items, so, need_by)
+            # 生成后页面自然重算，已覆盖的行自动消失
+
+        rows = build_rows()
+        has_buy = any((not r['is_assembly'])
+                      and r.get('buy_qty', D(0)) > 0
+                      for r in rows)
+        ctx = {'so': so, 'rows': rows, 'has_buy': has_buy,
+               'created_pos': created_pos, 'closed': closed,
+               'blocked': blocked}
+        return self._render(request, 'so_table.html', ctx)
+
     # ---------- 缺料总览 / 订单穿透 ----------
 
     def view_shortages(self, request):
         """缺料总览：所有开放订单的需求按零件聚合，谁缺、谁等、谁补。"""
         from django.http import HttpResponseForbidden
-        if not (request.user.is_authenticated and request.user.is_staff):
-            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        if not self._page_allowed(request):
+            return HttpResponseForbidden('无权访问：需员工身份或授权组成员')
         import orderflow
         rows = orderflow.collect_shortages()
         ctx = {'rows': rows}
@@ -1790,8 +1874,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
     def view_trace(self, request, kind, pk):
         """订单穿透树：SO→BO→PO 全链条状态。"""
         from django.http import HttpResponse, HttpResponseForbidden
-        if not (request.user.is_authenticated and request.user.is_staff):
-            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        if not self._page_allowed(request):
+            return HttpResponseForbidden('无权访问：需员工身份或授权组成员')
         from build.models import Build
         from order.models import PurchaseOrder, SalesOrder
         cls = {'salesorder': SalesOrder, 'build': Build,
@@ -1817,8 +1901,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
     def view_schedule_board(self, request):
         """三类开放订单按优先级排序的三栏看板。"""
         from django.http import HttpResponseForbidden
-        if not (request.user.is_authenticated and request.user.is_staff):
-            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        if not self._page_allowed(request):
+            return HttpResponseForbidden('无权访问：需员工身份或授权组成员')
         import orderflow
         from order.models import PurchaseOrder, SalesOrder
         from order.status_codes import (PurchaseOrderStatusGroups,
@@ -1983,56 +2067,6 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
             "      + '</a>';\n"
             "  }\n"
             "  target.innerHTML = html + '</div>';\n"
-            "}\n"
-            "export function renderPartTablePanel(target, ctx) {\n"
-            "  if (!target) { return; }\n"
-            "  var c = (ctx && ctx.context) || {};\n"
-            "  var rows = c.rows || [];\n"
-            "  var esc = function (s) { return String(s == null ? '' : s)\n"
-            "    .replace(/&/g,'&amp;').replace(/</g,'&lt;'); };\n"
-            "  var num = function (s) { var n = parseFloat(s);\n"
-            "    return isNaN(n) ? '0' : String(Math.round(n * 100) / 100); };\n"
-            "  if (!rows.length) {\n"
-            "    target.innerHTML = '<div style=\"color:#888\">无BOM明细</div>';\n"
-            "    return;\n"
-            "  }\n"
-            "  var th = 'border:1px solid #e2e2e2;padding:5px 8px;"
-            "background:#f6f8fa;text-align:left;white-space:nowrap';\n"
-            "  var td = 'border:1px solid #e2e2e2;padding:5px 8px';\n"
-            "  var html = '<div style=\"overflow-x:auto\">'\n"
-            "    + '<table style=\"border-collapse:collapse;font-size:13px;"
-            "width:100%\">'\n"
-            "    + '<tr><th style=\"' + th + '\">IPN</th>'\n"
-            "    + '<th style=\"' + th + '\">名称</th>'\n"
-            "    + '<th style=\"' + th + '\">单套需求</th>'\n"
-            "    + '<th style=\"' + th + '\">库存</th>'\n"
-            "    + '<th style=\"' + th + '\">在途</th>'\n"
-            "    + '<th style=\"' + th + '\">缺口</th></tr>';\n"
-            "  for (var i = 0; i < rows.length; i++) {\n"
-            "    var r = rows[i];\n"
-            "    var gap = parseFloat(r.gap) || 0;\n"
-            "    html += '<tr' + (gap > 0 ? ' style=\"background:#fff8f8\"' : '')\n"
-            "      + '>'\n"
-            "      + '<td style=\"' + td + ';font-family:monospace\">'\n"
-            "      + esc(r.ipn || '—') + '</td>'\n"
-            "      + '<td style=\"' + td + '\"><a href=\"/web/part/' + r.pk\n"
-            "      + '/\" style=\"color:#2f6feb;text-decoration:none\">'\n"
-            "      + esc(r.name) + '</a></td>'\n"
-            "      + '<td style=\"' + td + '\">' + num(r.need) + '</td>'\n"
-            "      + '<td style=\"' + td + '\">' + num(r.stock) + '</td>'\n"
-            "      + '<td style=\"' + td + '\">' + num(r.on_order) + '</td>'\n"
-            "      + '<td style=\"' + td + '\">'\n"
-            "      + (gap > 0 ? '<b style=\"color:#b3261e\">' + num(r.gap)\n"
-            "        + '</b>' : '<span style=\"color:#2b8a3e\">0</span>')\n"
-            "      + '</td></tr>';\n"
-            "  }\n"
-            "  html += '</table></div>';\n"
-            "  if (c.full_url) {\n"
-            "    html += '<p style=\"margin-top:8px\"><a href=\"' + c.full_url\n"
-            "      + '\" target=\"_blank\" style=\"color:#2f6feb\">'\n"
-            "      + '打开完整物料总表 →</a></p>';\n"
-            "  }\n"
-            "  target.innerHTML = html;\n"
             "}\n")
         resp = HttpResponse(js, content_type='application/javascript')
         resp['Cache-Control'] = 'no-cache'
@@ -2148,8 +2182,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
         from django.http import HttpResponseForbidden
         import bom_import
 
-        if not (request.user.is_authenticated and request.user.is_staff):
-            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        if not self._page_allowed(request):
+            return HttpResponseForbidden('无权访问：需员工身份或授权组成员')
 
         ctx = {'plugin': self,
                'prefill': request.GET.get('parent', '')}
@@ -2215,21 +2249,41 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
                           'w', encoding='utf-8') as fh:
                     json.dump({'headers': s['headers'], 'rows': srows},
                               fh, ensure_ascii=False)
+                img_map = bom_import.stash_images(
+                    s['images'], work, prefix=f's{idx}_')
                 meta.append({
                     'sheet': s['sheet'], 'json': f'sheet_{idx}.json',
                     'parent_pk': parent_pk, 'pname': pname,
                     'pipn': pipn, 'auto': pa,
                     'rows': len(srows),
-                    'imgs': bom_import.stash_images(
-                        s['images'], work, prefix=f's{idx}_')})
+                    'imgs': img_map})
                 g = self._guess_columns(s['headers'])
+                # 预览行：DISPIMG 单元格 → 缩略图URL（图片已落盘到
+                # MEDIA_ROOT/tmp，经 /media/ 可直接访问）
+                prev = []
+                for ri, r in enumerate(srows[:3], start=1):
+                    prow = []
+                    for h in s['headers']:
+                        v = r.get(h, '')
+                        if 'DISPIMG' in str(v):
+                            ip = img_map.get(ri)
+                            if ip:
+                                rel = os.path.relpath(
+                                    ip, dj_settings.MEDIA_ROOT)
+                                prow.append({
+                                    'img': dj_settings.MEDIA_URL
+                                    + rel.replace(os.sep, '/')})
+                            else:
+                                prow.append({'v': '（嵌入图片）'})
+                            continue
+                        prow.append({'v': v})
+                    prev.append(prow)
                 sheets_view.append({
                     'idx': idx, 'sheet': s['sheet'], 'headers': s['headers'],
                     'parent_pk': parent_pk, 'pname': pname,
                     'pipn': pipn, 'auto': pa, 'rows': len(srows),
                     'checked': True,
-                    'preview': [[r.get(h, '') for h in s['headers']]
-                                for r in srows[:3]],
+                    'preview': prev,
                     'guess': g,
                     'spec_sel': [g['spec']] if g['spec'] else []})
             request.session['bom_work'] = work
@@ -2494,8 +2548,8 @@ class WeiTiMDMPlugin(UrlsMixin, UserInterfaceMixin, ValidationMixin,
         import bom_import
         import supplier_import
 
-        if not (request.user.is_authenticated and request.user.is_staff):
-            return HttpResponseForbidden('需要以员工(staff)身份登录')
+        if not self._page_allowed(request):
+            return HttpResponseForbidden('无权访问：需员工身份或授权组成员')
 
         ctx = {'plugin': self}
         action = request.POST.get('action', '') if request.method == 'POST' else ''

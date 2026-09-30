@@ -1,39 +1,29 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>供应商导入 - {% if dry_run %}预览{% else %}结果{% endif %}</title>
-  <style>
-    body { font-family: system-ui, "Microsoft YaHei", sans-serif; max-width: 960px;
-           margin: 32px auto; padding: 0 16px; color: #222; }
-    h1 { font-size: 20px; }
-    .sum { display: flex; gap: 16px; margin: 16px 0; flex-wrap: wrap; }
-    .sum div { border: 1px solid #ddd; border-radius: 8px; padding: 12px 18px; min-width: 90px; }
-    .sum b { font-size: 22px; display: block; }
-    table { border-collapse: collapse; width: 100%; margin-top: 12px; font-size: 13px; }
-    th, td { border: 1px solid #e2e2e2; padding: 6px 8px; text-align: left; }
-    th { background: #f6f8fa; }
-    tr.bad td { background: #fdecea; }
-    .tag { padding: 1px 8px; border-radius: 10px; font-size: 12px; }
-    .created { background: #e6f4ea; color: #137333; }
-    .reused { background: #e8f0fe; color: #1967d2; }
-    .error { background: #fce8e6; color: #c5221f; }
-    .skip { background: #ececec; color: #666; }
-    .banner { padding: 12px 16px; border-radius: 6px; margin: 12px 0; }
-    h2.grp { font-size: 15px; margin: 22px 0 4px; padding-top: 12px;
-             border-top: 2px solid #e2e2e2; }
-    .hint { color: #888; font-size: 13px; margin: 4px 0; }
-    .dry { background: #fef7e0; color: #7a5900; }
-    .done { background: #e6f4ea; color: #137333; }
-    .btn { background: #137333; color: #fff; border: 0; padding: 10px 20px;
-           border-radius: 6px; font-size: 15px; cursor: pointer; }
-    a.plain { color: #2f6feb; text-decoration: none; margin-left: 12px; }
-  </style>
-</head>
-<body>
-  <h1>供应商导入{% if dry_run %} — 预览（未落库）{% else %} — 已完成{% endif %}</h1>
-  <p>共 {{ report.groups|length }} 个工作表；币种 {{ currency }}。</p>
+{% extends 'weiti_base.html' %}
+{% block title %}供应商导入 - {% if dry_run %}预览{% else %}结果{% endif %}{% endblock %}
+{% block subtitle %}供应商 · SKU · 价格阶梯{% endblock %}
+{% block extra_style %}
+<style>
+  .sum { display: flex; gap: 16px; margin: 16px 0; flex-wrap: wrap; }
+  .sum div { border: 1px solid var(--line); border-radius: 8px;
+             padding: 12px 18px; min-width: 90px; }
+  .sum b { font-size: 22px; display: block; }
+  tr.bad td { background: #fdecea; }
+  .tag { padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .created { background: #e6f4ea; color: #137333; }
+  .reused { background: #e8f0fe; color: #1967d2; }
+  .error { background: #fce8e6; color: #c5221f; }
+  .skip { background: #ececec; color: #666; }
+  .banner { padding: 12px 16px; border-radius: 6px; margin: 12px 0; }
+  h2.grp { font-size: 15px; margin: 22px 0 4px; padding-top: 12px;
+           border-top: 2px solid var(--line); }
+  .dry { background: #fef7e0; color: #7a5900; }
+  .done { background: #e6f4ea; color: #137333; }
+  a.plain { margin-left: 12px; }
+</style>
+{% endblock %}
+{% block body %}
+  <h1>供应商导入{% if dry_run %}<span class="meta">预览（未落库）</span>{% else %}<span class="meta">已完成</span>{% endif %}</h1>
+  <p class="hint">共 {{ report.groups|length }} 个工作表；币种 {{ currency }}。</p>
 
   {% if dry_run %}
     <div class="banner dry">这是预览，数据库<b>未改动</b>。核对无误后点下方「确认导入」。</div>
@@ -52,6 +42,7 @@
   <h2 class="grp">「{{ g.sheet }}」{% if g.skipped %} <span class="tag skip">已跳过（未勾选导入）</span>{% endif %}</h2>
   {% if not g.skipped %}
   <p class="hint">新建 {{ g.sub.created }} · 复用 {{ g.sub.reused }} · 价格 {{ g.sub.prices }} · 失败 {{ g.sub.failed }}</p>
+  <div style="overflow-x:auto">
   <table>
     <tr><th>行</th><th>零件</th><th>动作</th><th>供应商</th><th>说明</th></tr>
     {% for l in g.sub.lines %}
@@ -64,6 +55,7 @@
     </tr>
     {% endfor %}
   </table>
+  </div>
   {% endif %}
   {% endfor %}
 
@@ -72,11 +64,11 @@
     {% csrf_token %}
     <input type="hidden" name="action" value="commit">
     {% for name, val in mfields %}<input type="hidden" name="{{ name }}" value="{{ val }}">{% endfor %}
-    <button class="btn" type="submit">确认导入（写入数据库）</button>
+    <button class="btn" type="submit"
+      style="background:var(--ok);color:#fff;border:0;padding:10px 20px;border-radius:6px;font-size:14px;cursor:pointer">确认导入（写入数据库）</button>
     <a class="plain" href="./">取消 / 重新上传</a>
   </form>
   {% else %}
   <p style="margin-top:20px;"><a class="plain" href="./">再导一份</a></p>
   {% endif %}
-</body>
-</html>
+{% endblock %}

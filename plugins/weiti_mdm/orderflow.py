@@ -943,6 +943,11 @@ def _linked_pos(source):
                     for b in source.get_descendants(include_self=True)]
         except Exception:
             pass
+        # SO 层建的 PO（weiti_source=SalesOrder）同属本单家族，
+        # 也应计入本 BO 的关联在途
+        so_id = getattr(source, 'sales_order_id', None)
+        if so_id:
+            tags.append('SalesOrder:%s' % so_id)
         q = (Q(metadata__weiti_source__in=tags)
              | Q(metadata__weiti_root__in=tags))
     elif kind == 'SalesOrder':
@@ -993,6 +998,9 @@ def _linked_builds(source):
         except Exception:
             pass
         tags = ['Build:%s' % pk for pk in family]
+        so_id = getattr(source, 'sales_order_id', None)
+        if so_id:
+            tags.append('SalesOrder:%s' % so_id)
         q = (Q(pk__in=family)
              | Q(metadata__weiti_source__in=tags)
              | Q(metadata__weiti_root__in=tags))

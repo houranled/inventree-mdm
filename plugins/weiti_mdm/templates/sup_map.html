@@ -1,33 +1,28 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>供应商导入 - 映射列</title>
-  <style>
-    body { font-family: system-ui, "Microsoft YaHei", sans-serif; max-width: 960px;
-           margin: 32px auto; padding: 0 16px; color: #222; }
-    h1 { font-size: 20px; }
-    h2.sheet { font-size: 16px; margin: 0 0 10px; }
-    .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-top: 16px; }
-    label { display: block; margin: 12px 0 4px; font-weight: 600; }
-    select { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px 24px; }
-    .hint { color: #888; font-size: 13px; }
-    .btn { margin-top: 18px; background: #2f6feb; color: #fff; border: 0; padding: 10px 20px;
-           border-radius: 6px; font-size: 15px; cursor: pointer; }
-    table { border-collapse: collapse; width: 100%; margin-top: 16px; font-size: 13px; }
-    th, td { border: 1px solid #e2e2e2; padding: 6px 8px; text-align: left; }
-    th { background: #f6f8fa; }
-    .err { background: #fdecea; color: #b3261e; padding: 10px 14px; border-radius: 6px; margin-top: 12px; }
-    .cur { max-width: 140px; display: inline-block; margin-left: 8px; }
-    .use { display: inline; margin: 0 10px 0 0; font-weight: 600; }
-    .use input { margin-right: 4px; }
-    .card.off .grid, .card.off table, .card.off .hint { opacity: .4; }
-  </style>
-</head>
-<body>
-  <h1>映射列 — 共 {{ sheets_view|length }} 个工作表</h1>
+{% extends 'weiti_base.html' %}
+{% block title %}供应商导入 - 映射列{% endblock %}
+{% block subtitle %}供应商 · SKU · 价格阶梯{% endblock %}
+{% block extra_style %}
+<style>
+  h2.sheet { font-size: 16px; margin: 0 0 10px; }
+  label { display: block; margin: 12px 0 4px; font-weight: 600; }
+  select { width: 100%; padding: 8px; border: 1px solid var(--line);
+           border-radius: 6px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr 1fr;
+          gap: 12px 24px; }
+  .sheet-card { border: 1px solid var(--line); border-radius: 8px;
+                padding: 16px; margin-top: 16px; }
+  .err { background: #fdecea; color: #b3261e; padding: 10px 14px;
+         border-radius: 6px; margin-top: 12px; }
+  .cur { max-width: 140px; display: inline-block; margin-left: 8px;
+         width: auto; }
+  .use { display: inline; margin: 0 10px 0 0; font-weight: 600; }
+  .use input { margin-right: 4px; }
+  .sheet-card.off .grid, .sheet-card.off table,
+  .sheet-card.off .hint { opacity: .4; }
+</style>
+{% endblock %}
+{% block body %}
+  <h1>映射列<span class="meta">共 {{ sheets_view|length }} 个工作表</span></h1>
   <p class="hint">共 {{ row_count }} 行数据。每个工作表独立设置列映射
   （<b>零件标识</b>和<b>供应商</b>必填，其余可留空）。零件标识按 IPN 精确匹配、其次按名称。</p>
 
@@ -37,7 +32,7 @@
     {% csrf_token %}
     <input type="hidden" name="action" value="preview">
 
-    <div class="card">
+    <div class="sheet-card">
       <label style="display:inline">单价币种</label>
       <select class="cur" name="currency">
         <option value="CNY" {% if currency == "CNY" or not currency %}selected{% endif %}>CNY 人民币</option>
@@ -51,7 +46,7 @@
     </div>
 
     {% for s in sheets_view %}
-    <div class="card">
+    <div class="sheet-card">
       <h2 class="sheet"><label class="use"><input type="checkbox" class="use-cb" name="use_{{ s.idx }}" value="1"{% if s.checked %} checked{% endif %}>导入此表</label>
         「{{ s.sheet }}」 — {{ s.rows }} 行</h2>
       <div class="grid">
@@ -113,18 +108,23 @@
         </div>
       </div>
       <h3 class="hint">数据预览（前 {{ s.preview|length }} 行）</h3>
+      <div style="overflow-x:auto">
       <table>
         <tr>{% for h in s.headers %}<th>{{ h }}</th>{% endfor %}</tr>
         {% for r in s.preview %}<tr>{% for v in r %}<td>{{ v }}</td>{% endfor %}</tr>{% endfor %}
       </table>
+      </div>
     </div>
     {% endfor %}
-    <button class="btn" type="submit">预览（不落库）</button>
+    <button class="btn btn-primary" type="submit"
+      style="margin-top:18px;padding:10px 20px;font-size:14px">预览（不落库）</button>
   </form>
+{% endblock %}
+{% block scripts %}
   <script>
     // 取消勾选的表：置灰 + 摘掉必填，不再校验列映射
     document.querySelectorAll('.use-cb').forEach(function (cb) {
-      var card = cb.closest('.card');
+      var card = cb.closest('.sheet-card');
       function sync() {
         card.classList.toggle('off', !cb.checked);
         card.querySelectorAll('select[data-req]').forEach(function (s) {
@@ -135,5 +135,4 @@
       sync();
     });
   </script>
-</body>
-</html>
+{% endblock %}

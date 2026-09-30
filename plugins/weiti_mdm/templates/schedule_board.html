@@ -1,40 +1,37 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>排单看板</title>
-  <style>
-    body { font-family: system-ui, "Microsoft YaHei", sans-serif; max-width: 1280px;
-           margin: 32px auto; padding: 0 16px; color: #222; }
-    h1 { font-size: 20px; }
-    h2 { font-size: 15px; margin: 0 0 10px; }
-    .hint { color: #888; font-size: 13px; }
-    .cols { display: flex; gap: 16px; margin-top: 16px; align-items: flex-start; }
-    .col { flex: 1; min-width: 0; }
-    .card { border: 1px solid #e2e2e2; border-radius: 8px; padding: 10px 12px;
-            margin-bottom: 8px; background: #fff; }
-    .card.overdue { border-left: 4px solid #e8590c; }
-    .ref { font-weight: 700; }
-    .prio { float: right; font-weight: 700; color: #2f6feb; font-size: 13px; }
-    .meta { color: #666; font-size: 12px; margin-top: 4px; }
-    .kit { font-size: 12px; border-radius: 4px; padding: 1px 6px; margin-left: 6px; }
-    .kit.ok { background: #e6fcf5; color: #0ca678; }
-    .kit.no { background: #fff0f0; color: #e03131; }
-    .kit.unknown { background: #f1f3f5; color: #868e96; }
-    .src { color: #999; font-size: 11px; }
-    a.plain { color: #2f6feb; text-decoration: none; }
-    .none { color: #888; }
-    form.inline { display: inline; }
-    button { padding: 4px 14px; border: 1px solid #adb5bd; border-radius: 6px;
-             background: #fff; cursor: pointer; font-size: 13px; }
-    button:hover { background: #f1f3f5; }
-    .flash { color: #0ca678; font-size: 13px; margin-left: 10px; }
-  </style>
-</head>
-<body>
+{% extends 'weiti_base.html' %}
+{% block title %}排单看板{% endblock %}
+{% block subtitle %}订单 · 优先级 · 齐套{% endblock %}
+{% block extra_style %}
+<style>
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  .cols { display: flex; gap: 16px; margin-top: 16px;
+          align-items: flex-start; }
+  .col { flex: 1; min-width: 0; }
+  .ticket { border: 1px solid var(--line); border-radius: 8px;
+            padding: 10px 12px; margin-bottom: 8px; background: #fff; }
+  .ticket.overdue { border-left: 4px solid #e8590c; }
+  .ref { font-weight: 700; }
+  .prio { float: right; font-weight: 700; color: var(--brand);
+          font-size: 13px; }
+  .meta2 { color: #667; font-size: 12px; margin-top: 4px; }
+  .kit { font-size: 12px; border-radius: 4px; padding: 1px 6px;
+         margin-left: 6px; }
+  .kit.ok { background: #e6fcf5; color: #0ca678; }
+  .kit.no { background: #fff0f0; color: #e03131; }
+  .kit.unknown { background: #f1f3f5; color: #868e96; }
+  .src { color: var(--muted); font-size: 11px; }
+  .none { color: var(--muted); }
+  form.inline { display: inline; }
+  form.inline button { padding: 4px 14px; border: 1px solid var(--line);
+             border-radius: 6px; background: #fff; cursor: pointer;
+             font-size: 13px; }
+  form.inline button:hover { background: #f1f3f5; }
+  .flash { color: var(--ok); font-size: 13px; margin-left: 10px; }
+</style>
+{% endblock %}
+{% block body %}
   <h1>排单看板
-    <form class="inline" method="post">{% csrf_token %}
+    <form class="inline" method="post" style="margin-left:14px">{% csrf_token %}
       <button type="submit">重算优先级</button>
     </form>
     {% if recalc %}<span class="flash">已重算</span>{% endif %}
@@ -48,13 +45,13 @@
     <div class="col">
       <h2>{{ label }}</h2>
       {% for o in items %}
-      <div class="card{% if o.overdue %} overdue{% endif %}">
+      <div class="ticket{% if o.overdue %} overdue{% endif %}">
         <span class="prio">{{ o.prio }}</span>
-        <a class="plain ref" href="{{ o.url }}" target="_blank">{{ o.ref }}</a>
+        <a class="ref" href="{{ o.url }}" target="_blank">{{ o.ref }}</a>
         {% if o.kitted == True %}<span class="kit ok">已齐套</span>
         {% elif o.kitted == False %}<span class="kit no">缺料</span>
         {% else %}<span class="kit unknown">未检查</span>{% endif %}
-        <div class="meta">
+        <div class="meta2">
           {{ o.party }}{% if o.title %} · {{ o.title }}{% endif %}
           {% if o.target %}<br>交期 {{ o.target }}{% endif %}
           {% if o.src %}<br><span class="src">来源: {{ o.src }}</span>{% endif %}
@@ -67,10 +64,9 @@
     {% endfor %}
   </div>
 
-  <p style="margin-top:20px;">
-    <a class="plain" href="/plugin/weiti_mdm/bom-import/">BOM 导入</a> ·
-    <a class="plain" href="/plugin/weiti_mdm/supplier-import/">供应商导入</a> ·
-    <a class="plain" href="/plugin/weiti_mdm/pending-parts/">待完善编码</a>
-  </p>
-</body>
-</html>
+  <div class="foot">
+    <a href="/plugin/weiti_mdm/bom-import/">BOM 导入</a>
+    <a href="/plugin/weiti_mdm/supplier-import/">供应商导入</a>
+    <a href="/plugin/weiti_mdm/pending-parts/">待完善编码</a>
+  </div>
+{% endblock %}

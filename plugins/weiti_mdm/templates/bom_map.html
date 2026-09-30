@@ -1,36 +1,31 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BOM 导入 - 映射列</title>
-  <style>
-    body { font-family: system-ui, "Microsoft YaHei", sans-serif; max-width: 960px;
-           margin: 32px auto; padding: 0 16px; color: #222; }
-    h1 { font-size: 20px; }
-    h2.sheet { font-size: 16px; margin: 0 0 10px; }
-    .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-top: 16px; }
-    label { display: block; margin: 12px 0 4px; font-weight: 600; }
-    select { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 24px; }
-    .hint { color: #888; font-size: 13px; }
-    .btn { margin-top: 18px; background: #2f6feb; color: #fff; border: 0; padding: 10px 20px;
-           border-radius: 6px; font-size: 15px; cursor: pointer; }
-    table { border-collapse: collapse; width: 100%; margin-top: 16px; font-size: 13px; }
-    th, td { border: 1px solid #e2e2e2; padding: 6px 8px; text-align: left; }
-    th { background: #f6f8fa; }
-    .err { background: #fdecea; color: #b3261e; padding: 10px 14px; border-radius: 6px; margin-top: 12px; }
-    .use { display: inline; margin: 0 10px 0 0; font-weight: 600; }
-    .use input { margin-right: 4px; }
-    .card.off .grid, .card.off table, .card.off .hint { opacity: .4; }
-  </style>
-</head>
-<body>
+{% extends 'weiti_base.html' %}
+{% block title %}BOM 导入 - 映射列{% endblock %}
+{% block subtitle %}BOM · 零件 · 装配层级{% endblock %}
+{% block extra_style %}
+<style>
+  h2.sheet { font-size: 16px; margin: 0 0 10px; }
+  label { display: block; margin: 12px 0 4px; font-weight: 600; }
+  select { width: 100%; padding: 8px; border: 1px solid var(--line);
+           border-radius: 6px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 24px; }
+  .sheet-card { border: 1px solid var(--line); border-radius: 8px;
+                padding: 16px; margin-top: 16px; }
+  .err { background: #fdecea; color: #b3261e; padding: 10px 14px;
+         border-radius: 6px; margin-top: 12px; }
+  .use { display: inline; margin: 0 10px 0 0; font-weight: 600; }
+  .use input { margin-right: 4px; }
+  .sheet-card.off .grid, .sheet-card.off table,
+  .sheet-card.off .hint { opacity: .4; }
+  .pthumb { max-width: 64px; max-height: 48px; object-fit: cover;
+            border-radius: 4px; border: 1px solid var(--line); }
+</style>
+{% endblock %}
+{% block body %}
   {% if parent %}
-  <h1>映射列 — 父零件：{{ parent.name }} {% if parent.IPN %}({{ parent.IPN }}){% endif %}</h1>
+  <h1>映射列<span class="meta">父零件：{{ parent.name }}{% if parent.IPN %} ({{ parent.IPN }}){% endif %}</span></h1>
   <p class="hint">每个工作表将按表名各建/复用一个<b>子装配件</b>，作为 BOM 行挂到该父零件下。</p>
   {% else %}
-  <h1>映射列 — 共 {{ sheets_view|length }} 个工作表</h1>
+  <h1>映射列<span class="meta">共 {{ sheets_view|length }} 个工作表</span></h1>
   {% endif %}
   <p class="hint">共 {{ row_count }} 行数据。每个工作表独立设置列映射（组件名称必填，其余可留空）。</p>
 
@@ -40,7 +35,7 @@
     {% csrf_token %}
     <input type="hidden" name="action" value="preview">
     {% for s in sheets_view %}
-    <div class="card">
+    <div class="sheet-card">
       <h2 class="sheet"><label class="use"><input type="checkbox" class="use-cb" name="use_{{ s.idx }}" value="1"{% if s.checked %} checked{% endif %}>导入此表</label>
         「{{ s.sheet }}」 → {% if s.parent_pk %}#{{ s.parent_pk }} {% endif %}{{ s.pname }}{% if s.pipn %} ({{ s.pipn }}){% endif %}
         {% if s.auto == 'reused' %}<b>[复用已有零件]</b>{% elif s.auto %}<b>[提交时新建]</b>{% endif %}
@@ -77,18 +72,23 @@
       </div>
       <p class="hint">位号列自动识别：表头含「位号 / ref / designator」的列会自动写入 BOM 位号，无需配置。</p>
       <h3 class="hint">数据预览（前 {{ s.preview|length }} 行）</h3>
+      <div style="overflow-x:auto">
       <table>
         <tr>{% for h in s.headers %}<th>{{ h }}</th>{% endfor %}</tr>
-        {% for r in s.preview %}<tr>{% for v in r %}<td>{{ v }}</td>{% endfor %}</tr>{% endfor %}
+        {% for r in s.preview %}<tr>{% for c in r %}{% if c.img %}<td><img class="pthumb" src="{{ c.img }}"></td>{% else %}<td>{{ c.v }}</td>{% endif %}{% endfor %}</tr>{% endfor %}
       </table>
+      </div>
     </div>
     {% endfor %}
-    <button class="btn" type="submit">预览（不落库）</button>
+    <button class="btn btn-primary" type="submit"
+      style="margin-top:18px;padding:10px 20px;font-size:14px">预览（不落库）</button>
   </form>
+{% endblock %}
+{% block scripts %}
   <script>
     // 取消勾选的表：置灰 + 摘掉必填，不再校验列映射
     document.querySelectorAll('.use-cb').forEach(function (cb) {
-      var card = cb.closest('.card');
+      var card = cb.closest('.sheet-card');
       function sync() {
         card.classList.toggle('off', !cb.checked);
         card.querySelectorAll('select[data-req]').forEach(function (s) {
@@ -99,5 +99,4 @@
       sync();
     });
   </script>
-</body>
-</html>
+{% endblock %}

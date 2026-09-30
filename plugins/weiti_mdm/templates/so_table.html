@@ -1,0 +1,159 @@
+{% extends 'weiti_base.html' %}
+{% block title %}物料透查 — {{ so.reference }}{% endblock %}
+{% block subtitle %}物料透查 · 供需追溯{% endblock %}
+{% block extra_style %}
+<style>
+  .d0 { padding-left: 4px; } .d1 { padding-left: 24px; }
+  .d2 { padding-left: 44px; } .d3 { padding-left: 64px; }
+  .d4 { padding-left: 84px; } .d5 { padding-left: 104px; }
+  .d6 { padding-left: 124px; } .d7 { padding-left: 144px; }
+  .d8 { padding-left: 164px; }
+  .row-line td { background: var(--head); font-weight: 600; }
+</style>
+{% endblock %}
+{% block body %}
+  <div class="crumbs">
+    <a href="/web/sales/sales-order/{{ so.pk }}/">销售单</a> ›
+    物料透查
+  </div>
+  <h1>物料透查 — {{ so.reference }}
+    <span class="meta">{{ so.customer.name|default:"" }}</span></h1>
+  <p class="hint">按订单行逐层展开 BOM 到叶子件（缩进表示父子层级，
+    <span class="tag tag-asm">装配</span> 为半成品/子装配，
+    加粗行是订单行本身）。
+    缺口 = 还需新采购/新生产的量 = 所需 − 关联在途/在产 − 自由供给
+    （自由供给 = 可用库存 + 非本单自由在途/在产，即扣完其它订单
+    已承诺后的量；关联供给只计本销售单家族——本单及其全部
+    子孙生产单关联的采购行和生产单）。
+    关联订单列：装配行挂生产单、叶子行挂采购单。</p>
+
+  {% if closed %}
+  <p class="hint bad">该销售单已完成/已取消，物料透查仅供查看，
+    不能再生成采购单。</p>
+  {% endif %}
+  {% if blocked %}
+  <p class="hint bad">操作被拒绝：销售单已完成/已取消，未生成采购单。</p>
+  {% endif %}
+  {% if created_pos %}
+  <p class="hint" style="color:var(--ok)">已生成采购单：
+    {% for po in created_pos %}
+      <a target="_blank"
+        href="/web/purchasing/purchase-order/{{ po.pk }}/">{{ po.reference }}</a>
+    {% endfor %}
+    —— 已关联本销售单。</p>
+  {% endif %}
+
+  {% if has_buy and not closed %}
+  <form id="po-form" method="post"
+    action="/plugin/weiti_mdm/so-table/{{ so.pk }}/">
+    {% csrf_token %}
+    <input type="hidden" name="action" value="create_pos">
+    <button type="submit" class="btn btn-primary">生成采购单（按行内所选供应商）</button>
+    <span class="hint">在行内为每个缺料叶子件选好供应商后提交；生成的采购单自动关联本销售单。</span>
+  </form>
+  {% endif %}
+
+  {% if rows %}
+  <table>
+    <thead>
+    <tr>
+      <th>层级 / 名称</th><th>IPN</th>
+      <th class="num">所需</th>
+      <th class="num">可用库存</th>
+      <th>关联订单（生产单 / 采购单 · 状态 · 数量）</th>
+      <th class="num">缺口</th>
+    </tr>
+    </thead>
+    <tbody>
+    {% for r in rows %}
+    <tr class="{% if r.is_line %}row-line{% elif r.is_assembly %}row-asm{% elif r.gap > 0 and not r.polines %}row-short{% endif %}">
+      <td class="d{{ r.d }}">
+        {% if r.img %}<img class="thumb" src="{{ r.img }}">{% endif %}
+        <a href="/web/part/{{ r.part.pk }}/">{{ r.part.name }}</a>
+        {% if r.is_line %}<span class="tag" style="background:#f0e6ff;color:#6a3fb8">订单行</span>{% endif %}
+        {% if r.is_assembly %}<span class="tag tag-asm">装配</span>{% endif %}
+      </td>
+      <td class="ipn">{{ r.part.IPN|default:"—" }}</td>
+      <td class="num">
+        {{ r.need|floatformat:"-2" }}
+        {% if r.is_line %}
+          <br><span class="muted" style="font-weight:400">订单 {{ r.qty|floatformat:"-2" }}
+            · 已发 {{ r.shipped|floatformat:"-2" }}
+            · 已分配 {{ r.alloc|floatformat:"-2" }}</span>
+        {% endif %}
+      </td>
+      <td class="num">
+        {{ r.stock_avail|floatformat:"-2" }}
+        {% if r.stock_avail < r.stock %}
+          <br><span class="muted">实物 {{ r.stock|floatformat:"-2" }}
+            · 已承诺 {{ r.others|floatformat:"-2" }}</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if r.is_assembly %}
+          {% for cb in r.child_bos %}
+            <div class="po">
+              <a href="/web/manufacturing/build-order/{{ cb.pk }}/">{{ cb.ref }}</a>
+              · <span class="badge">{{ cb.status }}</span>
+              · 未完成 {{ cb.remain|floatformat:"-2" }}/{{ cb.qty|floatformat:"-2" }}
+              · <a target="_blank"
+                href="/plugin/weiti_mdm/build-table/{{ cb.pk }}/">透查 →</a>
+            </div>
+          {% empty %}
+            <span class="muted">未建子生产单</span>
+          {% endfor %}
+        {% else %}
+          {% for po in r.polines %}
+            <div class="po">
+              <a href="/web/purchasing/purchase-order/{{ po.pk }}/">{{ po.ref }}</a>
+            </div>
+          {% empty %}
+            <span class="muted">无关联采购单</span>
+          {% endfor %}
+          {% if r.own_supply > 0 %}
+            <div class="muted">关联在途/在产
+              {{ r.own_supply|floatformat:"-2" }}</div>
+          {% endif %}
+          {% if r.free_in > 0 %}
+            <div class="muted">自由在途/在产
+              {{ r.free_in|floatformat:"-2" }}（非本单，可分配本单）</div>
+          {% endif %}
+          {% if r.gap > 0 and not closed %}
+            {% if r.sp_opts %}
+            <div><select name="sp_{{ r.part.pk }}" form="po-form"
+                style="max-width:260px">
+              {% for c in r.sp_opts %}
+              <option value="{{ c.sp_pk }}">
+                {{ c.supplier }}{% if c.sku %} · {{ c.sku }}{% endif %}
+                {% if c.price %} · {{ c.price }}{% else %} · 无报价{% endif %}
+              </option>
+              {% endfor %}
+            </select></div>
+            {% else %}
+            <div><a class="buy-link" target="_blank"
+              href="/web/part/{{ r.part.pk }}/suppliers">+ 添加供应商</a></div>
+            {% endif %}
+          {% endif %}
+        {% endif %}
+      </td>
+      <td class="num">
+        {% if r.gap > 0 %}
+          <span class="gap">{{ r.gap|floatformat:"-2" }}</span>
+        {% else %}
+          <span class="ok">0</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="hint">该销售单没有订单行。</p>
+  {% endif %}
+
+  <div class="foot">
+    <a href="/web/sales/sales-order/{{ so.pk }}/">← 返回销售单</a>
+    <a href="/plugin/weiti_mdm/trace/salesorder/{{ so.pk }}/">订单穿透</a>
+    <a href="/plugin/weiti_mdm/shortages/">缺料总览</a>
+  </div>
+{% endblock %}
